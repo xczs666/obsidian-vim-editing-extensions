@@ -1,0 +1,27 @@
+{
+  "name": "vim-editing-extensions",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/xczs666/obsidian-vim-editing-extensions.git"
+  },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.js",
+    "test:runtime": "node --test test/runtime.test.js",
+    "test:obsidian": "OBSIDIAN_VIM_INSTALLED=1 node --test test/runtime.test.js",
+    "prepare-release": "npm run build && node scripts/prepare-release.mjs"
+  },
+  "devDependencies": {
+    "@codemirror/commands": "6.10.1",
+    "@codemirror/state": "6.5.2",
+    "@codemirror/view": "6.38.6",
+    "@replit/codemirror-vim": "6.4.0",
+    "esbuild": "0.28.2",
+    "jsdom": "27.2.0"
+  }
+}

@@ -1,0 +1,69 @@
+# Vim Editing Extensions
+
+扩展 Obsidian 内置 Vim 模式，提供自动文本对象和 sandwich 风格编辑。独立工作，不要求安装 Vimrc Support；也兼容已有 Vimrc Support 配置。
+
+## 文本对象
+
+| 对象 | 含义 | 示例 |
+| --- | --- | --- |
+| `iq` / `aq` | 自动识别双引号、单引号、反引号；内部 / 包含边界 | `viq`、`vaq`、`diq`、`daq`、`ciq`、`yiq` |
+| `ib` / `ab` | 自动识别括号、引号、HTML/XML 标签；内部 / 包含边界 | `vib`、`vab`、`dib`、`cab`、`yib` |
+
+`b` 遵循本机 sandwich 的自动包围结构行为，覆盖 `()`、`[]`、`{}`、`<>`、三种引号和标签。插件停用后，恢复 Obsidian 内置的 `b`（圆括号）。
+
+优先选择包含光标的最内层结构，计数向外选择。例如 `v2ib`、`d2ib`。可视模式继续输入 `ib` / `ab` 可扩大到下一层。无包含光标的结构时，只在当前行向后寻找，不跨行寻找无关目标。括号和完整标签本身可以跨行；引号只在同一行匹配。
+
+原有 `i"/a"`、`i'/a'`、`i(/a(`、`i[/a[`、`i{/a{`、`it/at` 等仍由内置 Vim 处理。
+
+## 添加、删除、替换包围符
+
+| 操作 | 命令 | 示例 |
+| --- | --- | --- |
+| 添加 | `sa{motion}{符号}` | `saiw)`：`hello` → `(hello)` |
+| 选区添加 | 选中文字后 `sa{符号}` | `viwsa"`：`hello` → `"hello"` |
+| 删除 | `sd{符号}` | `sd"`：`"hello"` → `hello` |
+| 自动删除 | `sdb` | `(hello)`、`"hello"`、`<b>hello</b>` → `hello` |
+| 替换 | `sr{旧符号}{新符号}` | `sr"'`：`"hello"` → `'hello'` |
+| 自动替换 | `srb{新符号}` | `srb"`：`(hello)` → `"hello"` |
+| 删除标签 | `sdt` / `sdT` | `<span class="x">hello</span>` → `hello` |
+| 改为普通包围符 | `srt"` | `<b>hello</b>` → `"hello"` |
+| 添加标签 | `saiwt`，输入 `span class="x"` 后回车 | `hello` → `<span class="x">hello</span>` |
+| 改为标签 | `sr"t`，输入标签后回车 | `"hello"` → `<span>hello</span>` |
+| 选区删除 / 替换 | 完整选中包围结构后 `sd` / `sr{新符号}` | `vabsd`、`vabsr"` |
+
+符号支持 `(`、`)`、`[`、`]`、`{`、`}`、`<`、`>`、双引号、单引号、反引号。左右括号等价，不自动增加空格。删除和替换保留内部原有空白。`t/T` 作为新包围类型时提示输入标签，两者在本插件中等价；替换标签时使用新输入的完整标签与属性。
+
+`q` 只用于文本对象，不是 `sdq` / `srq` 的引号别名；`b` 用于自动删除／替换，不作为添加圆括号的别名。添加圆括号请使用 `saiw)`，原有 `sb` 快捷键仍保留。
+
+## 计数、取消与历史
+
+- `2saiw)` 添加两层；`sa2w)` 把两词的 motion 结果一起包围。
+- `2sd)` 删除第二层圆括号；`2srb"` 替换第二层自动识别的结构。
+- 每次编辑用一次 `u` 撤销，`Ctrl-r` 重做；`.` 在当前位置重新执行上次新增的包围符操作，不复用旧坐标、不重新询问标签。普通 Vim 编辑会正常取代上次重复记录。
+- `Esc` 取消未完成输入。找不到目标、无效标签、自闭合标签、输入期间切换笔记或正文改变时不执行编辑。
+- 整行选区添加时将左右包围符放在独立行。删除包围符保留内容原有的换行。
+- 原有 `s"`、`s'`、`s(`、`[[` 等由 Vimrc Support 继续管理，其撤销和重复行为沿用该插件。
+
+## 启停与验证
+
+在“设置 → 第三方插件”中启用或停用 **Vim Editing Extensions**。无需关闭内置 Vim 模式。重新加载 Vimrc：在编辑区普通模式执行 `:source .obsidian.vimrc` 后回车。
+
+命令面板的 **Vim Editing Extensions: Run compatibility checks (temporary note)** 会创建一次性测试笔记，在源码模式和实时预览模式中输入测试命令，写入本插件目录的 `validation.json`，然后将测试笔记移入 Vault 回收站并恢复原标签页。它不会重新加载或改写 Vimrc。不会编辑现有笔记。
+
+开发：
+
+```sh
+npm ci
+npm test
+npm run build
+```
+
+测试包含纯文本匹配及真实 Vim 引擎的按键、选区、寄存器、历史和启停行为。默认测试使用公共的 CodeMirror Vim 引擎，可在 CI 中执行。macOS 可运行 `npm run test:obsidian`，从本机最新 Obsidian 更新包读取实际引擎；或设置 `OBSIDIAN_VIM_RUNTIME` 指向相应 `vim.js`。发行包不包含 Obsidian 引擎。
+
+## 首版边界
+
+适用于桌面版 Obsidian 1.14.5 及以上，实际验证版本记录在 `validation.json`。依赖非公开的 `CodeMirrorAdapter.Vim` 接口；能力检查失败时不注册扩展映射，并显示英文诊断。
+
+首版不支持函数／参数对象、自定义分隔符、前后对象搜索、矩形选区、多光标、宏及完整 Vim 插件移植。匹配基于 Markdown 源文本，不执行 HTML，不依赖语言语法树。
+
+启用时 `s` 作为多键命令前缀；停用时恢复原有单键 `s` 映射。公开项目使用 MIT 许可证，不包含个人 Vault 配置。

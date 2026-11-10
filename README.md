@@ -2,7 +2,7 @@
 
 [中文说明](README.zh-CN.md)
 
-Extend Obsidian's **built-in Vim mode** with automatic quote/surrounding text objects and sandwich-style editing. Works independently of Vimrc Support, and can coexist with an existing Vimrc configuration.
+Extend Obsidian's **built-in Vim mode** with automatic quote/surrounding text objects, sandwich-style editing, and register replacement. Works independently of Vimrc Support, and can coexist with an existing Vimrc configuration.
 
 ## Features
 
@@ -16,8 +16,19 @@ Extend Obsidian's **built-in Vim mode** with automatic quote/surrounding text ob
 | `sdb` / `srb{new}` | Automatically find surroundings to delete / replace | `srb"` changes `(hello)` to `"hello"` |
 | `sdt` / `sdT` | Remove matching tags and their attributes | `<span class="x">hello</span>` becomes `hello` |
 | `saiwt` | Add tags: enter a name and attributes, then press Enter | `span class="x"` produces `<span class="x">hello</span>` |
+| `gr{motion}` | Replace text with a Vim register, preserving copied text | `griw`, `griq`, `grib`, `gr$` |
+| `[count]grr` | Replace whole lines with a register | `grr`, `2grr` |
+| Visual selection + `gr` | Replace a characterwise or linewise selection | `viwgr`, `Vgr` |
 
-Supports characterwise and linewise visual selections, nesting, counts, registers for text-object operators, single-step undo, redo, and native dot-repeat for the new surround operations. `Esc` cancels pending input.
+Supports characterwise and linewise visual selections, nesting, counts, registers for text-object operators, single-step undo, redo, and native dot-repeat for surround and register replacement. `Esc` cancels pending input.
+
+### Register replacement
+
+Yank text with `yiw`, move to a target word, then type `griw`. Keep using `griw` or `.` to replace further targets without losing the copied text. Prefix a register name to choose a source, for example `"agriw` or `"0griw`; uppercase letters read the corresponding lowercase register. Dot-repeat reuses the source register name and reads its **current** contents. Counts enlarge the target range, not the inserted text; visual repeats reuse the selection's dimensions.
+
+Characterwise replacement removes one trailing newline from a linewise register. Whole-line replacement keeps the boundary with following text and preserves whether the target document ends in a newline. Whole-line edits place the cursor at the first non-whitespace character of the first inserted line; other edits place it at the replacement start.
+
+Only unnamed, letter and numbered Vim registers are supported. Clipboard (`+`/`*`), expression and other special registers, blockwise registers/selections and multiple cursors are unsupported. Empty registers and unsupported inputs produce a notice without editing text. Cancelled or failed replacements preserve the previous dot-repeat operation. No clipboard permissions or network access are requested.
 
 Both bracket keys, such as `(` and `)`, produce the same pair without adding spaces. Surround edits preserve existing inner whitespace. New tag inputs `t` and `T` are equivalent in this plugin.
 
@@ -25,7 +36,7 @@ The `q` identifier is a **text object**, not an `sdq` surround alias. The `b` id
 
 ## Install
 
-Requires desktop Obsidian **1.14.5 or later** and built-in Vim key bindings enabled in **Settings → Editor**. The Community directory submission is pending; use manual installation until the plugin is listed.
+Requires desktop Obsidian **1.14.5 or later** and built-in Vim key bindings enabled in **Settings → Editor**. Open the [Community directory listing](https://community.obsidian.md/plugins/vim-editing-extensions) or search **Vim Editing Extensions** in Community plugins. A new release may take time to appear in the desktop index. For manual installation:
 
 1. Download `main.js` and `manifest.json` from the [latest GitHub release](https://github.com/xczs666/obsidian-vim-editing-extensions/releases/latest).
 2. Create `<vault>/.obsidian/plugins/vim-editing-extensions/` and copy both files into it.
@@ -46,7 +57,7 @@ While enabled, `s` is reserved as a multi-key prefix; its usual single-key subst
 
 The plugin runs locally and makes **no network requests**. It has no accounts, telemetry, advertisements or remote services. Normal editing touches only the active editor.
 
-The optional **Run compatibility checks (temporary note)** command creates a disposable note in the current vault, tests source/live-preview editors through the actual Vim dispatcher, writes `validation.json` in the plugin folder, then moves the disposable note to the vault trash. It does not reload your Vimrc or edit existing notes.
+The optional **Run compatibility checks (temporary note)** command creates a disposable note in the current vault, tests source/live-preview editors through the actual Vim dispatcher, writes `validation.json` in the plugin folder, then moves the disposable note to the vault trash. It restores the Vim registers used by the checks, does not reload your Vimrc and does not edit existing notes.
 
 Development-only real-engine tests can read a locally installed Obsidian archive outside the vault when explicitly requested. These tests do not run when the plugin is loaded; Obsidian's engine is not bundled or redistributed.
 
@@ -71,4 +82,4 @@ Alternatively set `OBSIDIAN_VIM_RUNTIME` to a compatible `vim.js` file. Release 
 
 ## License and acknowledgments
 
-[MIT](LICENSE). Behavior is inspired by [vim-sandwich](https://github.com/machakann/vim-sandwich), [mini.ai](https://github.com/nvim-mini/mini.ai), and [targets.vim](https://github.com/wellle/targets.vim). This is an independent implementation on top of Obsidian's built-in Vim engine, not a redistribution of those Vim plugins or Obsidian itself.
+[MIT](LICENSE). Behavior is inspired by [vim-sandwich](https://github.com/machakann/vim-sandwich), [mini.ai](https://github.com/nvim-mini/mini.ai), [targets.vim](https://github.com/wellle/targets.vim), and [ReplaceWithRegister](https://github.com/vim-scripts/ReplaceWithRegister). This is an independent implementation on top of Obsidian's built-in Vim engine, not a redistribution of those Vim plugins or Obsidian itself.

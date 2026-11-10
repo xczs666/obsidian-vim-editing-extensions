@@ -24,7 +24,9 @@ const V = actualVim(CodeMirror, referenceVim);
 const originalDispatcher = V.findKey;
 const views = [];
 const prompts = new Map();
+const notices = [];
 const installOptions = {
+  notify(message) { notices.push(message); },
   prompt(cm, request) { prompts.set(cm, request); return () => { prompts.delete(cm); }; },
   applyEdit(cm, edit) {
     cm.operation(() => {
@@ -202,6 +204,155 @@ test('standalone install preserves and restores an existing single-s mapping', (
   keys(cm, 's'); assert.equal(cm.getValue(), 'ello');
   V.unmap('s', 'normal');
   controller = installVimExtensions(V, installOptions);
+});
+
+function setRegister(name, text, linewise = false, blockwise = false) {
+  V.getRegisterController().getRegister(name).setText(text, linewise, blockwise);
+}
+function registerState() {
+  const rc = V.getRegisterController();
+  return Object.fromEntries(['"', ...Object.keys(rc.registers)].map(name => {
+    const reg = rc.getRegister(name);
+    return [name, { text: reg.toString(), linewise: reg.linewise, blockwise: reg.blockwise }];
+  }));
+}
+
+test('gr uses native motions, counts, text objects and Unicode boundaries', () => {
+  for (const [text, cursor, command, expected] of [
+    ['old tail', 0, 'griw', 'NEW tail'],
+    ['old tail', 0, 'grw', 'NEWtail'],
+    ['old tail', 0, 'gr$', 'NEW'],
+    ['one two three', 0, 'gr2w', 'NEWthree'],
+    ['one two three', 0, '2grw', 'NEWthree'],
+    ['"old"', 2, 'griq', '"NEW"'],
+    ['[old]', 2, 'grib', '[NEW]'],
+    ['""', 0, 'griq', '"NEW"'],
+    ['"中文😀"', 2, 'griq', '"NEW"'],
+    ['one two', 4, 'grb', 'NEWtwo'],
+  ]) {
+    const cm = editor(text, cursor);
+    setRegister('"', 'NEW');
+    keys(cm, command);
+    assert.equal(cm.getValue(), expected, command + ' in ' + text);
+    assert.equal(V.getRegisterController().getRegister('"').toString(), 'NEW');
+  }
+});
+
+test('gr reads named and numbered registers and never overwrites copied text', () => {
+  const cm = editor('source old tail');
+  keys(cm, '"ayiw');
+  setRegister('0', 'ZERO');
+  cm.setCursor(cm.posFromIndex(7));
+  const saved = registerState();
+  keys(cm, '"agriw'); assert.equal(cm.getValue(), 'source source tail');
+  cm.setCursor(cm.posFromIndex(14));
+  keys(cm, '"Agriw'); assert.equal(cm.getValue(), 'source source source');
+  assert.deepEqual(registerState(), saved);
+  cm.setCursor(cm.posFromIndex(7));
+  keys(cm, '"0griw'); assert.equal(cm.getValue(), 'source ZERO source');
+  assert.deepEqual(registerState(), saved);
+});
+
+test('grr and visual gr honor line ranges, source types and EOF', () => {
+  for (const [text, cursor, command, value, linewise, expected] of [
+    ['old\nnext', 1, 'grr', '  NEW', false, '  NEW\nnext'],
+    ['one\ntwo\nthree', 1, '2grr', 'NEW\n', true, 'NEW\nthree'],
+    ['one\ntwo\nthree', 1, 'gr2r', 'NEW\n', true, 'NEW\nthree'],
+    ['old', 1, 'grr', 'NEW\n', true, 'NEW'],
+    ['old\n', 1, 'grr', 'NEW\n', true, 'NEW\n'],
+    ['one\ntwo', 5, 'grr', 'NEW\n', true, 'one\nNEW'],
+    ['old tail', 1, 'viwgr', 'NEW\n', true, 'NEW tail'],
+    ['old tail', 2, 'vhhgr', 'NEW', false, 'NEW tail'],
+    // Explicit line motions avoid jsdom's unavailable vertical layout metrics.
+    ['one\ntwo\nthree', 1, 'V2Ggr', 'NEW', false, 'NEW\nthree'],
+    ['one\ntwo', 5, 'Vgggr', 'NEW', false, 'NEW'],
+  ]) {
+    const cm = editor(text, cursor);
+    setRegister('"', value, linewise);
+    keys(cm, command);
+    assert.equal(cm.getValue(), expected, command + ' in ' + JSON.stringify(text));
+  }
+});
+
+test('gr supports current-register dot replay, atomic undo/redo and native edit takeover', () => {
+  const cm = editor('one two three');
+  setRegister('a', 'NEW');
+  keys(cm, '"agriw'); assert.equal(cm.getValue(), 'NEW two three');
+  keys(cm, 'w'); setRegister('a', 'NEXT');
+  keys(cm, '.'); assert.equal(cm.getValue(), 'NEW NEXT three');
+  keys(cm, 'u'); assert.equal(cm.getValue(), 'NEW two three');
+  keys(cm, '<C-r>'); assert.equal(cm.getValue(), 'NEW NEXT three');
+  keys(cm, 'w'); keys(cm, 'x.'); assert.equal(cm.getValue(), 'NEW NEXT ree');
+});
+
+test('gr dot replay preserves visual sizes and replaces counted ranges once', () => {
+  const cm = editor('one two three four');
+  setRegister('"', 'X');
+  keys(cm, 'grw'); assert.equal(cm.getValue(), 'Xtwo three four');
+  keys(cm, 'w2.'); assert.equal(cm.getValue(), 'Xtwo X');
+  const visual = editor('abc def ghi');
+  setRegister('"', 'X');
+  keys(visual, 'vllgr'); assert.equal(visual.getValue(), 'X def ghi');
+  keys(visual, 'w.'); assert.equal(visual.getValue(), 'X X ghi');
+  const countedVisual = editor('abc defghi tail');
+  setRegister('"', 'X');
+  keys(countedVisual, 'vllgrw2.'); assert.equal(countedVisual.getValue(), 'X X tail');
+  const lines = editor('one\ntwo\nthree\nfour\nfive\nsix');
+  setRegister('"', 'X');
+  keys(lines, 'V2Ggr'); assert.equal(lines.getValue(), 'X\nthree\nfour\nfive\nsix');
+  keys(lines, '2G.'); assert.equal(lines.getValue(), 'X\nX\nfive\nsix');
+  const multiline = editor('ab\ncd\nef\ngh');
+  setRegister('"', 'X');
+  keys(multiline, 'v2Ggr'); assert.equal(multiline.getValue(), 'Xd\nef\ngh');
+  keys(multiline, '2G.'); assert.equal(multiline.getValue(), 'Xd\nXh');
+  const unicode = editor('ab a😀tail');
+  setRegister('"', 'X');
+  keys(unicode, 'vlgrw.'); assert.equal(unicode.getValue(), 'X Xtail');
+});
+
+test('failed and cancelled gr preserve the previous edit, source register and selection', () => {
+  const cm = editor('one two');
+  keys(cm, 'ciwNEW<Esc>');
+  cm.setCursor(cm.posFromIndex(4));
+  const last = cm.state.vim.lastEditInputState;
+  setRegister('"', 'VALUE');
+  keys(cm, 'griq'); assert.equal(cm.getValue(), 'NEW two');
+  assert.equal(cm.state.vim.lastEditInputState, last);
+  keys(cm, 'gr<Esc>'); assert.equal(cm.state.vim.lastEditInputState, last);
+  setRegister('z', ''); keys(cm, '"zgriw');
+  assert.equal(cm.state.vim.lastEditInputState, last);
+  keys(cm, '"+griw'); assert.equal(cm.getValue(), 'NEW two');
+  assert.ok(notices.some(message => message.includes('clipboard')));
+  keys(cm, '.'); assert.equal(cm.getValue(), 'NEW NEW');
+  const visual = editor('one two');
+  setRegister('z', ''); keys(visual, 'viw"zgr');
+  assert.equal(visual.getValue(), 'one two'); assert.equal(visual.getSelection(), 'one');
+  assert.equal(visual.state.vim.visualMode, true);
+});
+
+test('gr rejects block registers, block selections and multiple cursors', () => {
+  const block = editor('one\ntwo');
+  setRegister('a', 'X', false, true);
+  keys(block, '"agriw'); assert.equal(block.getValue(), 'one\ntwo');
+  setRegister('"', 'NEW');
+  keys(block, '<C-v>jgr'); assert.equal(block.getValue(), 'one\ntwo');
+  keys(block, '<Esc>');
+  block.setSelections([{ anchor: { line: 0, ch: 0 }, head: { line: 0, ch: 0 } }, { anchor: { line: 1, ch: 0 }, head: { line: 1, ch: 0 } }]);
+  keys(block, 'griw'); assert.equal(block.getValue(), 'one\ntwo');
+});
+
+test('gr disable/re-enable restores pre-existing mappings', () => {
+  controller.uninstall();
+  V.map('gr', 'x', 'normal');
+  controller = installVimExtensions(V, installOptions);
+  const cm = editor('old tail');
+  setRegister('"', 'NEW'); keys(cm, 'griw');
+  assert.equal(cm.getValue(), 'NEW tail');
+  controller.uninstall(); keys(cm, 'gr');
+  assert.equal(cm.getValue(), 'EW tail');
+  V.unmap('gr', 'normal');
+  controller = installVimExtensions(V, installOptions);
+  setRegister('"', 'OK'); keys(cm, 'griw'); assert.equal(cm.getValue(), 'OK tail');
 });
 
 after(() => { controller.uninstall(); views.forEach(v => v.destroy()); dom.window.close(); });

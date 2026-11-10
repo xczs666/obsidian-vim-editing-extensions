@@ -1,5 +1,22 @@
 # Validation
 
+## Public release 0.2.0
+
+Validation date: 2026-11-10.
+
+| Check | Result |
+| --- | --- |
+| Portable reference-engine tests (`npm test`) | 31 / 31 passed |
+| Obsidian 1.15.0 actual bundled-engine integration tests (`npm run test:obsidian`) | 21 / 21 passed |
+| Obsidian 1.14.5 installed base-engine integration tests | 21 / 21 passed |
+| Running Obsidian 1.15.0 source editor | 48 / 48 passed |
+| Running Obsidian 1.15.0 live-preview editor | 48 / 48 passed |
+| Build and release asset generation | Passed |
+
+Register replacement checks cover native motions and text objects, counts, unnamed/named/numbered sources, copied-text preservation, line endings, EOF, Unicode, visual replacement and replay, native undo/redo, cancellation, unsupported inputs, and disable/re-enable behavior. Layout-independent explicit line motions are used in jsdom; the in-app linewise checks use the real editor layout.
+
+The in-app run used the built 0.2.0 plugin, an automatically created temporary note and the actual Vim adapter in both editing modes. The report contained 96 passing checks. The note was saved, moved to the vault trash and confirmed absent from the vault root; the check restores the Vim registers it uses. No existing note was used as a test buffer. Extracted engines and local validation reports are ignored and are not redistributed.
+
 ## Public release 0.1.1
 
 Validation date: 2026-11-09.

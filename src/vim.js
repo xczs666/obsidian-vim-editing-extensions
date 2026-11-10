@@ -1,8 +1,10 @@
 import { DELIMITERS, TARGETS, findPair, tagPair, editPair, wrapRange, visualPair } from './pairs.js';
+import { registerEdit } from './registers.js';
 
 const NAME = 'vimEditingExtensions';
 const ADD = '<VEEAdd>';
 const COMMIT = '<VEECommit>';
+const REGISTER_REPLACE = NAME + 'registerReplace';
 
 const copyPos = p => ({ line: p.line, ch: p.ch });
 function previousCharacter(text, end) {
@@ -13,13 +15,14 @@ function previousCharacter(text, end) {
 
 /** Extend one existing Vim instance; never install a second Vim key handler. */
 export function installVimExtensions(V, options) {
-  for (const method of ['defineMotion', 'defineAction', 'defineOperator', 'mapCommand', 'unmap', 'findKey', 'handleKey', 'getVimGlobalState_']) {
+  for (const method of ['defineMotion', 'defineAction', 'defineOperator', 'mapCommand', 'unmap', 'findKey', 'handleKey', 'getVimGlobalState_', 'getRegisterController']) {
     if (typeof V?.[method] !== 'function') throw new Error(`Unsupported Vim runtime: ${method} is unavailable`);
   }
   let enabled = true;
   const bindings = [];
   const sessions = new Map();
   const staged = new WeakMap();
+  const registerContexts = new WeakMap();
   const notify = options.notify ?? (() => {});
   const isCurrent = options.isCurrent ?? (() => true);
 
@@ -35,7 +38,27 @@ export function installVimExtensions(V, options) {
       input.keyBuffer.push(key);
       return () => true;
     }
-    return originalFindKey.call(this, cm, key, origin);
+    // evalInput records an edit before it knows whether a motion/register can
+    // produce an edit. Guard only our operator (including dot replay), so a
+    // failed replacement cannot destroy the previous repeat or visual selection.
+    const replacing = enabled && vim && !vim.insertMode && isCurrent(cm) && (
+      input?.operator === REGISTER_REPLACE ||
+      (!input?.operator && key === 'r' && /^\d*g$/.test(input?.keyBuffer.join('') ?? '')) ||
+      (key === '.' && vim.lastEditInputState?.operator === REGISTER_REPLACE));
+    const saved = replacing ? snapshot(cm) : null;
+    const text = replacing ? cm.getValue() : null;
+    const handler = originalFindKey.call(this, cm, key, origin);
+    if (!saved || typeof handler !== 'function') return handler;
+    return (...args) => {
+      if (input?.operator !== REGISTER_REPLACE) registerContexts.set(cm, { blocked: !supported(cm), saved, replay: key === '.' });
+      const result = handler(...args);
+      if (cm.getValue() === text) {
+        restoreEdit(cm, saved);
+        restoreSelection(cm, saved);
+      }
+      if (cm.state.vim.inputState.operator !== REGISTER_REPLACE) registerContexts.delete(cm);
+      return result;
+    };
   }
   V.findKey = findKey;
 
@@ -56,6 +79,7 @@ export function installVimExtensions(V, options) {
     const macro = V.getVimGlobalState_().macroModeState;
     return {
       lastEditInputState: vim.lastEditInputState,
+      repeatOverride: vim.lastEditInputState?.repeatOverride,
       lastEditActionCommand: vim.lastEditActionCommand,
       insertChanges: { ...macro.lastInsertModeChanges, changes: [...macro.lastInsertModeChanges.changes] },
       selections: cm.listSelections().map(r => ({ anchor: copyPos(r.anchor), head: copyPos(r.head) })),
@@ -64,11 +88,20 @@ export function installVimExtensions(V, options) {
     };
   }
   function restoreEdit(cm, saved) {
+    if (saved.lastEditInputState) saved.lastEditInputState.repeatOverride = saved.repeatOverride;
     Object.assign(cm.state.vim, {
       lastEditInputState: saved.lastEditInputState,
       lastEditActionCommand: saved.lastEditActionCommand,
     });
     V.getVimGlobalState_().macroModeState.lastInsertModeChanges = saved.insertChanges;
+  }
+  function restoreSelection(cm, saved) {
+    cm.operation(() => {
+      if (cm.curOp) cm.curOp.isVimOp = true;
+      cm.setSelections(saved.selections);
+      Object.assign(cm.state.vim, { visualMode: saved.visualMode, visualLine: saved.visualLine });
+      if (saved.sel) cm.state.vim.sel = saved.sel;
+    });
   }
   function cancel(cm, restoreSelection = true) {
     const s = sessions.get(cm);
@@ -263,6 +296,60 @@ export function installVimExtensions(V, options) {
   });
   bind('sa', 'action', 'startAdd');
   bind(ADD, 'operator', 'add');
+
+  function sourceRegister(name) {
+    if (name && name !== '"' && !/^[a-z0-9]$/i.test(name)) {
+      notify('Vim Editing Extensions: gr supports unnamed, letter and numbered Vim registers only; clipboard and special registers are not supported.');
+      return null;
+    }
+    const register = V.getRegisterController().getRegister(name?.toLowerCase());
+    if (register.blockwise) {
+      notify('Vim Editing Extensions: gr does not support blockwise registers.');
+      return null;
+    }
+    if (!register.toString()) {
+      notify('Vim Editing Extensions: gr source register is empty.');
+      return null;
+    }
+    return register;
+  }
+  V.defineOperator(REGISTER_REPLACE, (cm, args, ranges) => {
+    if (registerContexts.get(cm)?.blocked || !supported(cm)) return;
+    const register = sourceRegister(args.registerName);
+    if (!register) return;
+    const r = ranges[0];
+    let from = Math.min(cm.indexFromPos(r.anchor), cm.indexFromPos(r.head));
+    let to = Math.max(cm.indexFromPos(r.anchor), cm.indexFromPos(r.head));
+    if (cm.state.vim.visualMode && args.lastSel) {
+      // Some adapters already expand line selections, while evalInput also
+      // advances the supplied head. Vim's inclusive visual endpoints are stable.
+      const sel = args.lastSel;
+      const a = cm.indexFromPos(sel.anchor), h = cm.indexFromPos(sel.head);
+      const start = a <= h ? sel.anchor : sel.head;
+      const end = a <= h ? sel.head : sel.anchor;
+      const context = registerContexts.get(cm);
+      if (context?.replay && args.visualSize) {
+        const head = context.saved.selections[0].head;
+        const count = args.repeat || 1;
+        from = cm.indexFromPos(args.linewise ? { line: head.line, ch: 0 } : head);
+        if (args.linewise) to = cm.indexFromPos({ line: head.line + args.visualSize.lines * count, ch: 0 });
+        else if (args.visualSize.lines === 1) to = Math.min(from + args.visualSize.width * count, cm.indexFromPos({ line: head.line, ch: Infinity }));
+        else to = cm.indexFromPos({ line: head.line + args.visualSize.lines * count - 1, ch: args.visualSize.endColumn });
+      } else {
+        from = cm.indexFromPos(args.linewise ? { line: start.line, ch: 0 } : start);
+        const endIndex = cm.indexFromPos(end);
+        const endColumn = end.ch + (cm.getValue().codePointAt(endIndex) > 0xFFFF ? 2 : 1);
+        to = cm.indexFromPos(args.linewise ? { line: end.line + 1, ch: 0 } : { line: end.line, ch: endColumn });
+        args.visualSize = { lines: end.line - start.line + 1, width: to - from, endColumn };
+      }
+    }
+    const edit = registerEdit(cm.getValue(), from, to, register.toString(), register.linewise, args.linewise);
+    if (!edit || !apply(cm, edit)) return;
+    return cm.posFromIndex(edit.cursor);
+  });
+  // The native multikey-operator shortcut turns `grr` into expandToLine and
+  // keeps counts, register prefixes, text objects and dot replay in the engine.
+  bind('gr', 'operator', 'registerReplace');
 
   return {
     cancelAll() { for (const cm of [...sessions.keys()]) cancel(cm, false); },

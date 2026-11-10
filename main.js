@@ -171,10 +171,23 @@ function visualPair(text, from, to, count = 1, replacement = ["", ""]) {
   return { from, to, insert: prefix + replacement[0].repeat(count) + content + replacement[1].repeat(count) + suffix, cursor: from };
 }
 
+// src/registers.js
+function registerEdit(text, from, to, value, registerLinewise, linewise) {
+  if (!value) return null;
+  const insideSurrogate = (at) => at > 0 && at < text.length && /[\uD800-\uDBFF]/.test(text[at - 1]) && /[\uDC00-\uDFFF]/.test(text[at]);
+  if (insideSurrogate(from)) from--;
+  if (insideSurrogate(to)) to++;
+  let insert = registerLinewise && value.endsWith("\n") ? value.slice(0, -1) : value;
+  if (linewise && (to < text.length || text.endsWith("\n")) && !insert.endsWith("\n")) insert += "\n";
+  const cursor = from + (linewise ? insert.match(/^[^\S\n]*/)[0].length : 0);
+  return { from, to, insert, cursor };
+}
+
 // src/vim.js
 var NAME = "vimEditingExtensions";
 var ADD = "<VEEAdd>";
 var COMMIT = "<VEECommit>";
+var REGISTER_REPLACE = NAME + "registerReplace";
 var copyPos = (p) => ({ line: p.line, ch: p.ch });
 function previousCharacter(text, end) {
   if (end <= 0) return 0;
@@ -182,13 +195,14 @@ function previousCharacter(text, end) {
   return end - (low >= 56320 && low <= 57343 && end > 1 ? 2 : 1);
 }
 function installVimExtensions(V, options) {
-  for (const method of ["defineMotion", "defineAction", "defineOperator", "mapCommand", "unmap", "findKey", "handleKey", "getVimGlobalState_"]) {
+  for (const method of ["defineMotion", "defineAction", "defineOperator", "mapCommand", "unmap", "findKey", "handleKey", "getVimGlobalState_", "getRegisterController"]) {
     if (typeof V?.[method] !== "function") throw new Error(`Unsupported Vim runtime: ${method} is unavailable`);
   }
   let enabled = true;
   const bindings = [];
   const sessions = /* @__PURE__ */ new Map();
   const staged = /* @__PURE__ */ new WeakMap();
+  const registerContexts = /* @__PURE__ */ new WeakMap();
   const notify = options.notify ?? (() => {
   });
   const isCurrent = options.isCurrent ?? (() => true);
@@ -200,7 +214,21 @@ function installVimExtensions(V, options) {
       input.keyBuffer.push(key);
       return () => true;
     }
-    return originalFindKey.call(this, cm, key, origin);
+    const replacing = enabled && vim && !vim.insertMode && isCurrent(cm) && (input?.operator === REGISTER_REPLACE || !input?.operator && key === "r" && /^\d*g$/.test(input?.keyBuffer.join("") ?? "") || key === "." && vim.lastEditInputState?.operator === REGISTER_REPLACE);
+    const saved = replacing ? snapshot(cm) : null;
+    const text = replacing ? cm.getValue() : null;
+    const handler = originalFindKey.call(this, cm, key, origin);
+    if (!saved || typeof handler !== "function") return handler;
+    return (...args) => {
+      if (input?.operator !== REGISTER_REPLACE) registerContexts.set(cm, { blocked: !supported(cm), saved, replay: key === "." });
+      const result = handler(...args);
+      if (cm.getValue() === text) {
+        restoreEdit(cm, saved);
+        restoreSelection(cm, saved);
+      }
+      if (cm.state.vim.inputState.operator !== REGISTER_REPLACE) registerContexts.delete(cm);
+      return result;
+    };
   }
   V.findKey = findKey;
   function bind(keys, type, name, args = {}, extra = {}) {
@@ -220,6 +248,7 @@ function installVimExtensions(V, options) {
     const macro = V.getVimGlobalState_().macroModeState;
     return {
       lastEditInputState: vim.lastEditInputState,
+      repeatOverride: vim.lastEditInputState?.repeatOverride,
       lastEditActionCommand: vim.lastEditActionCommand,
       insertChanges: { ...macro.lastInsertModeChanges, changes: [...macro.lastInsertModeChanges.changes] },
       selections: cm.listSelections().map((r) => ({ anchor: copyPos(r.anchor), head: copyPos(r.head) })),
@@ -229,19 +258,28 @@ function installVimExtensions(V, options) {
     };
   }
   function restoreEdit(cm, saved) {
+    if (saved.lastEditInputState) saved.lastEditInputState.repeatOverride = saved.repeatOverride;
     Object.assign(cm.state.vim, {
       lastEditInputState: saved.lastEditInputState,
       lastEditActionCommand: saved.lastEditActionCommand
     });
     V.getVimGlobalState_().macroModeState.lastInsertModeChanges = saved.insertChanges;
   }
-  function cancel(cm, restoreSelection = true) {
+  function restoreSelection(cm, saved) {
+    cm.operation(() => {
+      if (cm.curOp) cm.curOp.isVimOp = true;
+      cm.setSelections(saved.selections);
+      Object.assign(cm.state.vim, { visualMode: saved.visualMode, visualLine: saved.visualLine });
+      if (saved.sel) cm.state.vim.sel = saved.sel;
+    });
+  }
+  function cancel(cm, restoreSelection2 = true) {
     const s = sessions.get(cm);
     if (!s) return;
     sessions.delete(cm);
     s.close?.();
     restoreEdit(cm, s.saved);
-    if (restoreSelection && cm.getValue() === s.text && isCurrent(cm)) {
+    if (restoreSelection2 && cm.getValue() === s.text && isCurrent(cm)) {
       cm.operation(() => {
         if (cm.curOp) cm.curOp.isVimOp = true;
         cm.setSelections(s.saved.selections);
@@ -445,6 +483,55 @@ function installVimExtensions(V, options) {
   });
   bind("sa", "action", "startAdd");
   bind(ADD, "operator", "add");
+  function sourceRegister(name) {
+    if (name && name !== '"' && !/^[a-z0-9]$/i.test(name)) {
+      notify("Vim Editing Extensions: gr supports unnamed, letter and numbered Vim registers only; clipboard and special registers are not supported.");
+      return null;
+    }
+    const register = V.getRegisterController().getRegister(name?.toLowerCase());
+    if (register.blockwise) {
+      notify("Vim Editing Extensions: gr does not support blockwise registers.");
+      return null;
+    }
+    if (!register.toString()) {
+      notify("Vim Editing Extensions: gr source register is empty.");
+      return null;
+    }
+    return register;
+  }
+  V.defineOperator(REGISTER_REPLACE, (cm, args, ranges) => {
+    if (registerContexts.get(cm)?.blocked || !supported(cm)) return;
+    const register = sourceRegister(args.registerName);
+    if (!register) return;
+    const r = ranges[0];
+    let from = Math.min(cm.indexFromPos(r.anchor), cm.indexFromPos(r.head));
+    let to = Math.max(cm.indexFromPos(r.anchor), cm.indexFromPos(r.head));
+    if (cm.state.vim.visualMode && args.lastSel) {
+      const sel = args.lastSel;
+      const a = cm.indexFromPos(sel.anchor), h = cm.indexFromPos(sel.head);
+      const start = a <= h ? sel.anchor : sel.head;
+      const end = a <= h ? sel.head : sel.anchor;
+      const context = registerContexts.get(cm);
+      if (context?.replay && args.visualSize) {
+        const head = context.saved.selections[0].head;
+        const count = args.repeat || 1;
+        from = cm.indexFromPos(args.linewise ? { line: head.line, ch: 0 } : head);
+        if (args.linewise) to = cm.indexFromPos({ line: head.line + args.visualSize.lines * count, ch: 0 });
+        else if (args.visualSize.lines === 1) to = Math.min(from + args.visualSize.width * count, cm.indexFromPos({ line: head.line, ch: Infinity }));
+        else to = cm.indexFromPos({ line: head.line + args.visualSize.lines * count - 1, ch: args.visualSize.endColumn });
+      } else {
+        from = cm.indexFromPos(args.linewise ? { line: start.line, ch: 0 } : start);
+        const endIndex = cm.indexFromPos(end);
+        const endColumn = end.ch + (cm.getValue().codePointAt(endIndex) > 65535 ? 2 : 1);
+        to = cm.indexFromPos(args.linewise ? { line: end.line + 1, ch: 0 } : { line: end.line, ch: endColumn });
+        args.visualSize = { lines: end.line - start.line + 1, width: to - from, endColumn };
+      }
+    }
+    const edit = registerEdit(cm.getValue(), from, to, register.toString(), register.linewise, args.linewise);
+    if (!edit || !apply(cm, edit)) return;
+    return cm.posFromIndex(edit.cursor);
+  });
+  bind("gr", "operator", "registerReplace");
   return {
     cancelAll() {
       for (const cm of [...sessions.keys()]) cancel(cm, false);
@@ -472,6 +559,7 @@ async function runSmoke(plugin) {
   const leaf = app.workspace.getLeaf("tab");
   const results = [];
   let view;
+  let restoreRegisters;
   const pause = () => new Promise((resolve) => setTimeout(resolve, 40));
   try {
     await leaf.openFile(file, { active: true, state: { mode: "source" } });
@@ -483,11 +571,25 @@ async function runSmoke(plugin) {
     const win = cm.getWrapperElement().ownerDocument.defaultView;
     const V = win.CodeMirrorAdapter.Vim;
     if (!plugin.controllers.has(V)) throw new Error("Vim extensions were not registered");
+    const registers = V.getRegisterController();
+    const originalRegisters = { ...registers.registers };
+    const originals = new Map([...Object.values(originalRegisters), registers.unnamedRegister].map((register) => [register, {
+      ...register,
+      keyBuffer: [...register.keyBuffer],
+      insertModeChanges: [...register.insertModeChanges],
+      searchQueries: [...register.searchQueries]
+    }]));
+    restoreRegisters = () => {
+      for (const name of Object.keys(registers.registers)) delete registers.registers[name];
+      Object.assign(registers.registers, originalRegisters);
+      for (const [register, saved] of originals) Object.assign(register, saved);
+    };
     const editor = view.editor;
     async function reset(text, cursor = 0) {
       V.handleKey(cm, "<Esc>");
       editor.setValue(text);
       editor.setCursor(editor.offsetToPos(cursor));
+      registers.getRegister("z").setText("");
       await pause();
     }
     async function keys(sequence) {
@@ -527,7 +629,24 @@ async function runSmoke(plugin) {
       ['vabsr"', "(hello)", 2, '"hello"'],
       ['saiwtspan class="x"<CR>', "hello", 0, '<span class="x">hello</span>'],
       ["saiw)<Esc>", "hello", 0, "(hello)"],
-      ["saiw<Esc>", "hello", 0, "hello"]
+      ["saiw<Esc>", "hello", 0, "hello"],
+      ["yiwwgriw", "NEW old", 0, "NEW NEW"],
+      ['"ayiww"agriw', "NEW old", 0, "NEW NEW"],
+      ['"ayiww"Agriw', "NEW old", 0, "NEW NEW"],
+      ['yiww"0griw', "NEW old", 0, "NEW NEW"],
+      ["yiwwgriq", 'NEW "old"', 0, 'NEW "NEW"'],
+      ["yiwwgrib", "NEW [old]", 0, "NEW [NEW]"],
+      ["yiwwgr2w", "NEW one two tail", 0, "NEW NEWtail"],
+      ["yiw2Ggrr", "NEW\nold\nnext", 0, "NEW\nNEW\nnext"],
+      ["yy2Ggrr", "NEW\nold\nnext", 0, "NEW\nNEW\nnext"],
+      ["yiw2G2grr", "NEW\none\ntwo\nnext", 0, "NEW\nNEW\nnext"],
+      ["yy2Ggriw", "NEW\nold", 0, "NEW\nNEW"],
+      ["yiwwviwgr", "NEW old", 0, "NEW NEW"],
+      ["yiw2GVjgr", "NEW\none\ntwo\nnext", 0, "NEW\nNEW\nnext"],
+      ["yiwwgriq", 'NEW "\u4E2D\u6587\u{1F600}"', 0, 'NEW "NEW"'],
+      ['"zgriw', "old", 0, "old"],
+      ['"+griw', "old", 0, "old"],
+      ["yiwwgr<Esc>", "NEW old", 0, "NEW old"]
     ];
     for (const live of [false, true]) {
       await view.setState({ ...view.getState(), mode: "source", source: !live }, { history: false });
@@ -550,9 +669,18 @@ async function runSmoke(plugin) {
       results.push({ mode: live ? "live-preview" : "source", command: "atomic undo", passed: editor.getValue() === "(hello) world", actual: editor.getValue() });
       await keys("<C-r>");
       results.push({ mode: live ? "live-preview" : "source", command: "redo", passed: editor.getValue() === "(hello) (world)", actual: editor.getValue() });
+      await reset("NEW one two");
+      await keys("yiwwgriww.");
+      results.push({ mode: live ? "live-preview" : "source", command: "gr + repeat", passed: editor.getValue() === "NEW NEW NEW", actual: editor.getValue() });
+      results.push({ mode: live ? "live-preview" : "source", command: "gr preserves register", passed: registers.getRegister('"').toString() === "NEW" });
+      await keys("u");
+      results.push({ mode: live ? "live-preview" : "source", command: "gr atomic undo", passed: editor.getValue() === "NEW NEW two", actual: editor.getValue() });
+      await keys("<C-r>");
+      results.push({ mode: live ? "live-preview" : "source", command: "gr redo", passed: editor.getValue() === "NEW NEW NEW", actual: editor.getValue() });
     }
     return { runtime: app.getVersion?.() ?? win.require("obsidian").apiVersion, testedAt: (/* @__PURE__ */ new Date()).toISOString(), passed: results.filter((r) => r.passed).length, results };
   } finally {
+    restoreRegisters?.();
     await view?.save?.();
     leaf.detach();
     if (original) app.workspace.setActiveLeaf(original, { focus: true });

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0
+
+- Add `viT/vaT` whole-table selection and `yiT/yaT` linewise Markdown yank from source and live-preview cell editors.
+- Keep table selections independent of nested cell focus, with a whole-table highlight and reliable delayed `y` handling.
+- Preserve native tag/paragraph objects and register behavior; cancel stale selections and reject unsupported table editing/counts.
+- Add table settings, identifier conflict preservation and in-app/runtime regression checks.
+
 ## 0.3.0
 
 - Add configurable prefix timeout (0 means unlimited), original-mapping fallback on timeout/mismatch, and generic remaining-key handoff without depending on another plugin.

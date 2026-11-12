@@ -136,6 +136,23 @@ export async function runSmoke(plugin) {
       results.push({ mode: live ? 'live-preview' : 'source', command: 'gr atomic undo', passed: editor.getValue() === 'NEW NEW two', actual: editor.getValue() });
       await keys('<C-r>');
       results.push({ mode: live ? 'live-preview' : 'source', command: 'gr redo', passed: editor.getValue() === 'NEW NEW NEW', actual: editor.getValue() });
+      const tableTrigger = plugin.settings?.bindings.T ?? 'T';
+      if (plugin.settings?.groups.tables && tableTrigger) {
+        const text = '| Name | Value |\n| --- | --- |\n| alpha | one |\n| beta | two |\n';
+        for (const command of ['yi' + tableTrigger, 'vi' + tableTrigger]) {
+          await reset(text, text.indexOf('alpha'));
+          await keys(command);
+          if (command.startsWith('v')) {
+            // Let live preview reconcile the editor before the copy key.
+            await new Promise(resolve => setTimeout(resolve, 80));
+            await keys('y');
+          }
+          const actual = registers.getRegister('"').toString();
+          // Entering a rendered cell may normalize table alignment whitespace.
+          const expected = editor.getValue();
+          results.push({ mode: live ? 'live-preview' : 'source', command: command + (command.startsWith('v') ? ' + delayed y' : ''), expected, actual, passed: actual === expected && registers.getRegister('"').linewise });
+        }
+      }
     }
     return { runtime: app.getVersion?.() ?? win.require('obsidian').apiVersion, testedAt: new Date().toISOString(), skippedObjectGroups, passed: results.filter(r => r.passed).length, results };
   } finally {

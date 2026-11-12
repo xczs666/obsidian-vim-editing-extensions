@@ -26,6 +26,7 @@ module.exports = __toCommonJS(main_exports);
 var import_obsidian2 = require("obsidian");
 var import_state = require("@codemirror/state");
 var import_commands = require("@codemirror/commands");
+var import_view = require("@codemirror/view");
 
 // src/pairs.js
 var DELIMITERS = Object.freeze({
@@ -598,7 +599,8 @@ var GROUPS = {
   indentation: "Indentation text objects",
   keyValue: "Single-line keys and values",
   arguments: "Arguments and function calls",
-  custom: "Custom boundary prompts"
+  custom: "Custom boundary prompts",
+  tables: "Markdown table selection and yank"
 };
 var OPTIONAL = { url: "URL object (L)", whitespace: "Whitespace variants (I/A)", buffer: "Entire document (gG)" };
 var DEFAULT_SETTINGS = { groups: Object.fromEntries(Object.keys(GROUPS).map((k) => [k, true])), navigation: true, url: false, whitespace: false, buffer: false, prefixTimeoutMs: 0, bindings: {} };
@@ -616,12 +618,15 @@ var OBJECTS = [
     ["v", "keyValue", "Value"],
     ["a", "arguments", "Argument"],
     ["f", "arguments", "Function call"],
-    ["?", "custom", "Custom boundaries"]
+    ["?", "custom", "Custom boundaries"],
+    ["T", "tables", "Markdown table"]
   ].map(([id, group, label]) => ({ id, group, label, trigger: id, whitespace: ["D", "o", "?"].includes(id) }))
 ];
 function normalizeSettings(input = {}) {
   input ??= {};
-  return { ...DEFAULT_SETTINGS, ...input, groups: { ...DEFAULT_SETTINGS.groups, ...input.groups }, bindings: { ...input.bindings } };
+  const bindings = { ...input.bindings };
+  if (!Object.hasOwn(bindings, "T") && Object.values(bindings).includes("T")) bindings.T = "";
+  return { ...DEFAULT_SETTINGS, ...input, groups: { ...DEFAULT_SETTINGS.groups, ...input.groups }, bindings };
 }
 function objectMappings(input) {
   const settings = normalizeSettings(input), result = [], used = /* @__PURE__ */ new Set();
@@ -642,6 +647,7 @@ function objectMappings(input) {
     }
     if (used.has(trigger)) throw new Error(`Duplicate text-object identifier: ${trigger}`);
     used.add(trigger);
+    if (item.id === "T") continue;
     if (item.disabled) continue;
     const variants = ["i", "a", ...settings.whitespace && item.whitespace ? ["I", "A"] : []];
     for (const variant of variants) for (const [modifier, direction] of [["", "current"], ...settings.navigation ? [["n", "next"], ["l", "previous"]] : []]) {
@@ -785,6 +791,157 @@ function prefixWait({ lookup, timeoutMs, isCurrent, getEvent = () => null }) {
   };
 }
 
+// src/tables.js
+function cells(line) {
+  if (/^(?: {4}|\t| {0,3}>)/.test(line)) return null;
+  const pipes = [];
+  for (let i = 0; i < line.length; i++) if (line[i] === "|") {
+    let slashes = 0;
+    for (let j = i - 1; j >= 0 && line[j] === "\\"; j--) slashes++;
+    if (!(slashes % 2)) pipes.push(i);
+  }
+  if (!pipes.length) return null;
+  const result = [];
+  let start = 0;
+  for (const end of pipes) {
+    result.push(line.slice(start, end).trim());
+    start = end + 1;
+  }
+  result.push(line.slice(start).trim());
+  if (!result[0]) result.shift();
+  if (!result.at(-1)) result.pop();
+  return result;
+}
+function bodyRow(line) {
+  return !!line.trim() && !/^(?: {4}|\t| {0,3}(?:>|#{1,6}(?:\s|$)|`{3,}|~{3,}|[-+*]\s|\d+[.)]\s|<(?:!--|(?:script|pre|style|textarea|div|table)\b)))/i.test(line) && !/^ {0,3}(?:[-*_]\s*){3,}$/.test(line);
+}
+function tableAt(text, at, variant = "i") {
+  let offset = 0, fence = null, frontmatter = /^(?:---)\r?(?:\n|$)/.test(text);
+  const rows = text.split("\n").map((value) => {
+    const row = { from: offset, end: offset + value.length, value: value.replace(/\r$/, "") };
+    offset += value.length + 1;
+    row.to = Math.min(offset, text.length);
+    return row;
+  });
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i], token = r.value.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (frontmatter) {
+      if (i > 0 && /^(---|\.\.\.)\s*$/.test(r.value)) frontmatter = false;
+      continue;
+    }
+    if (token) {
+      if (!fence) fence = token[1];
+      else if (token[1][0] === fence[0] && token[1].length >= fence.length && !token[2].trim()) fence = null;
+      continue;
+    }
+    if (fence) continue;
+    const header = cells(r.value), separator = rows[i + 1] && cells(rows[i + 1].value);
+    if (!header?.length || header.length !== separator?.length || !separator.every((v) => /^:?-+:?$/.test(v))) continue;
+    let last = i + 1;
+    while (rows[last + 1] && bodyRow(rows[last + 1].value)) last++;
+    const tableFrom = r.from, tableTo = rows[last].to;
+    if (at >= tableFrom && (at < tableTo || at === tableTo && tableTo === text.length)) {
+      let from = tableFrom, to = tableTo;
+      if (variant === "a") {
+        if (rows[last + 1] && !rows[last + 1].value.trim()) to = rows[last + 1].to;
+        else if (i > 0 && !rows[i - 1].value.trim()) from = rows[i - 1].from;
+      }
+      return { from, to, tableFrom, tableTo, linewise: true };
+    }
+    i = last;
+  }
+  return null;
+}
+
+// src/table-commands.js
+function tableCommands(V, { settings, context, paint = () => {
+}, notify = () => {
+} }) {
+  let selected = null, registerPrefix = false;
+  const trigger = settings.bindings.T ?? "T";
+  const enabled = settings.groups.tables && trigger;
+  function cancel() {
+    const previous = selected;
+    selected = null;
+    registerPrefix = false;
+    if (previous) {
+      paint(previous.root, null);
+      if (previous.root.state.vim?.visualMode && previous.root.cm6?.dom.isConnected !== false) clear(previous.root);
+    }
+  }
+  function valid(c) {
+    return selected && c?.root === selected.root && c.root.getValue() === selected.text && (!selected.doc || c.root.cm6?.state.doc === selected.doc) && c.at >= selected.from && c.at <= selected.to;
+  }
+  function clear(cm) {
+    V.handleKey(cm, "<Esc>", "vim-editing-extensions");
+  }
+  function yank(cm, range, register) {
+    const text = range.root.getValue().slice(range.from, range.to);
+    cancel();
+    clear(cm);
+    V.getRegisterController().pushText(register, "yank", text, true, false);
+  }
+  return {
+    cancel,
+    hasSelection: (cm) => !!selected && context(cm)?.root === selected.root,
+    findKey(cm, key) {
+      if (!enabled) return null;
+      const vim = cm.state.vim, input = vim?.inputState;
+      if (!vim) return null;
+      const c = context(cm);
+      if (selected) {
+        if (!valid(c) || vim.insertMode) cancel();
+        else {
+          if (key === '"') {
+            registerPrefix = true;
+            return null;
+          }
+          if (registerPrefix) {
+            registerPrefix = false;
+            return null;
+          }
+          if (key === "y") {
+            const range2 = selected, register2 = input.registerName;
+            return { handler: () => {
+              yank(cm, range2, register2);
+              return true;
+            } };
+          }
+          cancel();
+          if (["d", "c", "r", "x", "s", ">", "<", "=", "g", ".", "p", "P"].includes(key)) {
+            return { handler: () => {
+              clear(cm);
+              notify("Vim Editing Extensions: table objects support selection and yank only.");
+              return true;
+            } };
+          }
+        }
+      }
+      if (!c || key !== trigger || vim.insertMode || !/^\d*[ia]$/.test(input.keyBuffer.join("")) || !vim.visualMode && !input.operator) return null;
+      const register = input.registerName, variant = input.keyBuffer.at(-1);
+      const copy = input.operator === "yank";
+      const supported = !vim.visualBlock && cm.listSelections().length === 1 && (copy || !input.operator && vim.visualMode) && (input.getRepeat() || 1) === 1;
+      const range = supported && tableAt(c.root.getValue(), c.at, variant);
+      return { handler: () => {
+        if (!range) {
+          clear(cm);
+          notify(supported ? "Vim Editing Extensions: no Markdown table at the cursor." : "Vim Editing Extensions: table objects support one table, selection and yank only.");
+          return true;
+        }
+        const prepared = { ...range, root: c.root, text: c.root.getValue(), doc: c.root.cm6?.state.doc };
+        if (copy) yank(cm, prepared, register);
+        else {
+          clear(cm);
+          selected = prepared;
+          paint(c.root, range);
+          notify("Table selected. Press y to copy or Esc to cancel.");
+        }
+        return true;
+      } };
+    }
+  };
+}
+
 // src/vim.js
 var NAME = "vimEditingExtensions";
 var ADD = "<VEEAdd>";
@@ -815,9 +972,19 @@ function installVimExtensions(V, options) {
   });
   const isCurrent = options.isCurrent ?? (() => true);
   const originalFindKey = V.findKey;
+  const tables = tableCommands(V, {
+    settings,
+    notify,
+    context: options.tableContext ?? ((cm) => isCurrent(cm) ? { root: cm, at: cm.indexFromPos(cm.getCursor()) } : null),
+    paint: options.paintTable ?? ((cm, range) => {
+      if (range) cm.setSelection(cm.posFromIndex(range.from), cm.posFromIndex(range.to));
+    })
+  });
   const prefixes = prefixWait({ lookup, timeoutMs: settings.prefixTimeoutMs, isCurrent, getEvent: options.getEvent });
   function findKey(cm, key, origin) {
     if (prefixes.forwarding) return;
+    const table = tables.findKey(cm, key);
+    if (table) return table.handler;
     const pending = prefixes.resolve(cm, key, origin);
     if (pending) return pending.handler;
     const vim = cm.state.vim;
@@ -1218,18 +1385,23 @@ function installVimExtensions(V, options) {
   bind("gr", "operator", "registerReplace");
   return {
     cancelAll() {
+      tables.cancel();
       prefixes.cancelAll();
       for (const cm of [...sessions.keys()]) cancel(cm, false);
+    },
+    cancelTables() {
+      tables.cancel();
     },
     cancelPrefixes() {
       prefixes.cancelAll();
     },
-    hasPending: (cm) => sessions.has(cm) || prefixes.hasPending(cm),
+    hasPending: (cm) => sessions.has(cm) || prefixes.hasPending(cm) || tables.hasSelection(cm),
     finishInput(cm, key) {
       const s = sessions.get(cm);
       if (s && !s.close && (["<Esc>", "<C-c>", "<C-[>"].includes(key) || !cm.state.vim.inputState.operator)) cancel(cm);
     },
     uninstall() {
+      tables.cancel();
       prefixes.cancelAll();
       for (const cm of [...sessions.keys()]) cancel(cm);
       enabled = false;
@@ -1394,6 +1566,21 @@ async function runSmoke(plugin) {
       results.push({ mode: live ? "live-preview" : "source", command: "gr atomic undo", passed: editor.getValue() === "NEW NEW two", actual: editor.getValue() });
       await keys("<C-r>");
       results.push({ mode: live ? "live-preview" : "source", command: "gr redo", passed: editor.getValue() === "NEW NEW NEW", actual: editor.getValue() });
+      const tableTrigger = plugin.settings?.bindings.T ?? "T";
+      if (plugin.settings?.groups.tables && tableTrigger) {
+        const text = "| Name | Value |\n| --- | --- |\n| alpha | one |\n| beta | two |\n";
+        for (const command of ["yi" + tableTrigger, "vi" + tableTrigger]) {
+          await reset(text, text.indexOf("alpha"));
+          await keys(command);
+          if (command.startsWith("v")) {
+            await new Promise((resolve) => setTimeout(resolve, 80));
+            await keys("y");
+          }
+          const actual = registers.getRegister('"').toString();
+          const expected = editor.getValue();
+          results.push({ mode: live ? "live-preview" : "source", command: command + (command.startsWith("v") ? " + delayed y" : ""), expected, actual, passed: actual === expected && registers.getRegister('"').linewise });
+        }
+      }
     }
     return { runtime: app.getVersion?.() ?? win.require("obsidian").apiVersion, testedAt: (/* @__PURE__ */ new Date()).toISOString(), skippedObjectGroups, passed: results.filter((r) => r.passed).length, results };
   } finally {
@@ -1450,7 +1637,7 @@ var EditingSettingsTab = class extends import_obsidian.PluginSettingTab {
         timeoutInput.focus();
       }
     }));
-    for (const [id, name] of Object.entries(GROUPS)) new import_obsidian.Setting(el).setName(name).addToggle((toggle) => toggle.setValue(plugin.settings.groups[id]).onChange(async (value) => {
+    for (const [id, name] of Object.entries(GROUPS)) new import_obsidian.Setting(el).setName(name).setDesc(id === "tables" ? "iT/aT select or yank a complete Markdown table, including in live-preview cells. Editing operators and counts are not supported." : "").addToggle((toggle) => toggle.setValue(plugin.settings.groups[id]).onChange(async (value) => {
       await update({ ...plugin.settings, groups: { ...plugin.settings.groups, [id]: value } });
     }));
     new import_obsidian.Setting(el).setName("Next/previous objects").setDesc("in/an and il/al variants can search across lines.").addToggle((toggle) => toggle.setValue(plugin.settings.navigation).onChange((value) => update({ ...plugin.settings, navigation: value })));
@@ -1493,6 +1680,34 @@ var VimEditingExtensions = class extends import_obsidian2.Plugin {
     this.disposed = false;
     this.reported = false;
     this.keyEvents = /* @__PURE__ */ new WeakMap();
+    this.tableRanges = /* @__PURE__ */ new Map();
+    const plugin = this;
+    this.registerEditorExtension([
+      import_view.EditorView.baseTheme({
+        ".vee-table-selection": { outline: "2px solid var(--interactive-accent)", outlineOffset: "2px" },
+        ".vee-table-selection td, .vee-table-selection th": { backgroundColor: "var(--text-selection)" }
+      }),
+      import_view.ViewPlugin.fromClass(class {
+        constructor(view) {
+          this.view = view;
+        }
+        update(update) {
+          if (update.docChanged && plugin.tableRanges.has(update.view)) {
+            const previous = plugin.tableRanges.get(update.view);
+            queueMicrotask(() => {
+              if (plugin.tableRanges.get(update.view) === previous) {
+                for (const controller of plugin.controllers.values()) controller.cancelTables();
+              }
+            });
+          }
+          if (plugin.tableRanges.has(update.view)) update.view.requestMeasure({ key: this, read() {
+          }, write: () => plugin.paintTableDOM(update.view) });
+        }
+        destroy() {
+          plugin.tableRanges.delete(this.view);
+        }
+      })
+    ]);
     this.settings = normalizeSettings(await this.loadData());
     try {
       objectMappings(this.settings);
@@ -1529,6 +1744,36 @@ var VimEditingExtensions = class extends import_obsidian2.Plugin {
   getCM(view) {
     return view?.editMode?.editor?.cm?.cm ?? view?.editor?.cm?.cm;
   }
+  tableContext(cm) {
+    const root = this.getCM(this.app.workspace.activeLeaf?.view);
+    if (!root || root !== cm && !root.cm6?.dom.contains(cm.cm6?.dom)) return null;
+    return { root, at: root.indexFromPos(root.getCursor()) };
+  }
+  paintTable(root, range) {
+    const view = root.cm6;
+    if (range) {
+      this.tableRanges.set(view, range);
+      if (this.app.workspace.activeLeaf?.view.getState().source) {
+        root.setSelection(root.posFromIndex(range.from), root.posFromIndex(range.to));
+      }
+    } else this.tableRanges.delete(view);
+    view.requestMeasure({ key: this, read() {
+    }, write: () => this.paintTableDOM(view) });
+  }
+  paintTableDOM(view) {
+    const range = this.tableRanges.get(view);
+    for (const table of view.dom.querySelectorAll("table")) {
+      let selected = false;
+      if (range) {
+        try {
+          const at = view.posAtDOM(table);
+          selected = at >= range.tableFrom && at < range.tableTo;
+        } catch {
+        }
+      }
+      table.classList.toggle("vee-table-selection", selected);
+    }
+  }
   async updateSettings(settings) {
     const next = normalizeSettings(settings);
     objectMappings(next);
@@ -1560,6 +1805,8 @@ var VimEditingExtensions = class extends import_obsidian2.Plugin {
           notify: (text) => new import_obsidian2.Notice(text),
           isCurrent: (cm) => this.getCM(this.app.workspace.activeLeaf?.view) === cm,
           getEvent: () => this.keyEvents.get(win),
+          tableContext: (cm) => this.tableContext(cm),
+          paintTable: (cm, range) => this.paintTable(cm, range),
           prompt: (cm, request) => this.prompt(cm, request),
           applyEdit: (cm, edit) => this.applyEdit(cm, edit)
         });
@@ -1567,10 +1814,12 @@ var VimEditingExtensions = class extends import_obsidian2.Plugin {
         this.keyWindows ??= /* @__PURE__ */ new WeakSet();
         if (!this.keyWindows.has(win)) {
           const cancel = () => this.controllers.get(V)?.cancelPrefixes();
+          const cancelTables = () => this.controllers.get(V)?.cancelTables();
           this.registerDomEvent(win, "keydown", (event) => {
             if (isForwardedKey(event)) return;
             if (event.isComposing || event.keyCode === 229) {
               cancel();
+              cancelTables();
               return;
             }
             this.keyEvents.set(win, event);
@@ -1583,9 +1832,16 @@ var VimEditingExtensions = class extends import_obsidian2.Plugin {
             }, 0);
           }, true);
           this.registerDomEvent(win, "blur", cancel);
+          this.registerDomEvent(win, "blur", cancelTables);
           this.registerDomEvent(win.document, "pointerdown", cancel, true);
+          this.registerDomEvent(win.document, "pointerdown", cancelTables, true);
           this.registerDomEvent(win.document, "compositionstart", cancel, true);
+          this.registerDomEvent(win.document, "compositionstart", cancelTables, true);
           this.registerDomEvent(win.document, "focusin", cancel, true);
+          this.registerDomEvent(win.document, "focusin", (event) => {
+            const root = this.getCM(this.app.workspace.activeLeaf?.view);
+            if (!root?.cm6?.dom.contains(event.target)) cancelTables();
+          }, true);
         }
         this.keyWindows.add(win);
       } catch (error) {

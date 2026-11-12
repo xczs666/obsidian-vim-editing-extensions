@@ -642,4 +642,76 @@ test('an internal Vim mapping never forwards its unrelated physical trigger to t
   }, { getEvent: () => event });
 });
 
+const TABLE = '| Name | Value |\n| --- | --- |\n| alpha | one |\n| beta | two |\n';
+test('whole-table yank preserves Markdown and native named, append and black-hole register behavior', () => {
+  const cm = editor('Before\n\n' + TABLE + '\nAfter', 15);
+  keys(cm, 'yiT');
+  assert.equal(V.getRegisterController().getRegister('"').toString(), TABLE);
+  assert.equal(V.getRegisterController().getRegister('0').toString(), TABLE);
+  assert.equal(V.getRegisterController().getRegister('"').linewise, true);
+  keys(cm, '"zyiT'); assert.equal(V.getRegisterController().getRegister('z').toString(), TABLE);
+  keys(cm, '"ZyiT'); assert.equal(V.getRegisterController().getRegister('z').toString(), TABLE + TABLE);
+  const saved = registerState(); keys(cm, '"_yiT'); assert.deepEqual(registerState(), saved);
+  assert.equal(cm.getValue(), 'Before\n\n' + TABLE + '\nAfter');
+  keys(cm, 'yaT'); assert.equal(V.getRegisterController().getRegister('"').toString(), TABLE + '\n');
+});
+
+test('visual table selection yanks from the outer document after a cell editor loses its visual selection', async () => {
+  controller.uninstall();
+  const root = editor('Before\n\n' + TABLE + '\nAfter', 40), header = editor('Name'), body = editor('alpha');
+  const painted = [];
+  controller = installVimExtensions(V, { ...installOptions,
+    isCurrent: cm => cm === root,
+    tableContext: cm => [root, header, body].includes(cm) ? { root, at: 40 } : null,
+    paintTable: (cm, range) => painted.push({ cm, range }),
+  });
+  try {
+    keys(header, 'viT');
+    assert.equal(painted.at(-1).cm, root);
+    assert.equal(root.getValue().slice(painted.at(-1).range.from, painted.at(-1).range.to), TABLE);
+    // Real live preview reconciles/refocuses nested editors between physical
+    // keys. Neither the native selection nor the original cell may survive.
+    root.setCursor({ line: 4, ch: 4 }); header.state.vim.visualMode = false;
+    await new Promise(resolve => setTimeout(resolve, 30));
+    keys(body, 'y');
+    assert.equal(V.getRegisterController().getRegister('"').toString(), TABLE);
+    assert.equal(painted.at(-1).range, null);
+    keys(body, 'yiT'); assert.equal(V.getRegisterController().getRegister('"').toString(), TABLE);
+    keys(body, 'viT"zy'); assert.equal(V.getRegisterController().getRegister('z').toString(), TABLE);
+    assert.equal(body.getValue(), 'alpha'); assert.equal(header.getValue(), 'Name');
+  } finally { controller.uninstall(); controller = installVimExtensions(V, installOptions); }
+});
+
+test('table selection cancels on Esc, document changes, other keys and uninstall without copying stale text', () => {
+  const cm = editor(TABLE, 5);
+  setRegister('z', 'KEEP');
+  for (const change of [() => keys(cm, '<Esc>'), () => controller.cancelTables(), () => keys(cm, 'h')]) {
+    keys(cm, 'viT'); assert.equal(controller.hasPending(cm), true);
+    change(); assert.equal(controller.hasPending(cm), false);
+  }
+  keys(cm, 'viT'); cm.setValue('changed'); keys(cm, 'y<Esc>');
+  assert.equal(V.getRegisterController().getRegister('z').toString(), 'KEEP');
+  assert.equal(cm.getValue(), 'changed');
+  cm.setValue(TABLE); keys(cm, 'viT'); controller.uninstall();
+  assert.equal(controller.hasPending(cm), false);
+  controller = installVimExtensions(V, installOptions);
+});
+
+test('table commands reject unsupported editing/counts and retain native lowercase tag and paragraph objects', () => {
+  for (const sequence of ['diT', 'ciT', '2yiT', 'viTd']) {
+    const cm = editor(TABLE, 5), before = registerState(); keys(cm, sequence);
+    assert.equal(cm.getValue(), TABLE); assert.deepEqual(registerState(), before);
+  }
+  controller.uninstall();
+  const native = editor('<b>hello</b>', 4); keys(native, 'vit'); const tag = native.getSelection();
+  keys(native, '<Esc>vip'); const paragraph = native.getSelection();
+  controller = installVimExtensions(V, installOptions);
+  const cm = editor('<b>hello</b>', 4); keys(cm, 'vit'); assert.equal(cm.getSelection(), tag);
+  keys(cm, '<Esc>vip'); assert.equal(cm.getSelection(), paragraph);
+  controller.uninstall();
+  controller = installVimExtensions(V, { ...installOptions, settings: { bindings: { T: 'Z' } } });
+  const custom = editor(TABLE, 5); keys(custom, 'yiZ'); assert.equal(V.getRegisterController().getRegister('"').toString(), TABLE);
+  controller.uninstall(); controller = installVimExtensions(V, installOptions);
+});
+
 after(() => { controller.uninstall(); views.forEach(v => v.destroy()); dom.window.close(); });

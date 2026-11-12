@@ -36,7 +36,7 @@ export class EditingSettingsTab extends PluginSettingTab {
         timeoutInput.focus();
       }
     }));
-    for (const [id, name] of Object.entries(GROUPS)) new Setting(el).setName(name).addToggle(toggle => toggle.setValue(plugin.settings.groups[id]).onChange(async value => {
+    for (const [id, name] of Object.entries(GROUPS)) new Setting(el).setName(name).setDesc(id === 'tables' ? 'iT/aT select or yank a complete Markdown table, including in live-preview cells. Editing operators and counts are not supported.' : '').addToggle(toggle => toggle.setValue(plugin.settings.groups[id]).onChange(async value => {
       await update({ ...plugin.settings, groups: { ...plugin.settings.groups, [id]: value } });
     }));
     new Setting(el).setName('Next/previous objects').setDesc('in/an and il/al variants can search across lines.').addToggle(toggle => toggle.setValue(plugin.settings.navigation).onChange(value => update({ ...plugin.settings, navigation: value })));

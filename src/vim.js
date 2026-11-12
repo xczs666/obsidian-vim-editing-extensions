@@ -3,6 +3,7 @@ import { registerEdit } from './registers.js';
 import { resolveObject } from './objects.js';
 import { objectMappings, normalizeSettings } from './object-settings.js';
 import { cloneInput, prefixWait } from './prefixes.js';
+import { tableCommands } from './table-commands.js';
 
 const NAME = 'vimEditingExtensions';
 const ADD = '<VEEAdd>';
@@ -39,9 +40,16 @@ export function installVimExtensions(V, options) {
   // every multi-key `sa/sd/sr` prefix. Defer its dispatch while enabled without
   // deleting the original keymap (including any user's custom single-s map).
   const originalFindKey = V.findKey;
+  const tables = tableCommands(V, {
+    settings, notify,
+    context: options.tableContext ?? (cm => isCurrent(cm) ? { root: cm, at: cm.indexFromPos(cm.getCursor()) } : null),
+    paint: options.paintTable ?? ((cm, range) => { if (range) cm.setSelection(cm.posFromIndex(range.from), cm.posFromIndex(range.to)); }),
+  });
   const prefixes = prefixWait({ lookup, timeoutMs: settings.prefixTimeoutMs, isCurrent, getEvent: options.getEvent });
   function findKey(cm, key, origin) {
     if (prefixes.forwarding) return;
+    const table = tables.findKey(cm, key);
+    if (table) return table.handler;
     const pending = prefixes.resolve(cm, key, origin);
     if (pending) return pending.handler;
     const vim = cm.state.vim;
@@ -419,15 +427,17 @@ export function installVimExtensions(V, options) {
   bind('gr', 'operator', 'registerReplace');
 
   return {
-    cancelAll() { prefixes.cancelAll(); for (const cm of [...sessions.keys()]) cancel(cm, false); },
+    cancelAll() { tables.cancel(); prefixes.cancelAll(); for (const cm of [...sessions.keys()]) cancel(cm, false); },
+    cancelTables() { tables.cancel(); },
     cancelPrefixes() { prefixes.cancelAll(); },
-    hasPending: cm => sessions.has(cm) || prefixes.hasPending(cm),
+    hasPending: cm => sessions.has(cm) || prefixes.hasPending(cm) || tables.hasSelection(cm),
     finishInput(cm, key) {
       // Called after a physical key, not during the engine's internal clearInputState.
       const s = sessions.get(cm);
       if (s && !s.close && (['<Esc>', '<C-c>', '<C-[>'].includes(key) || !cm.state.vim.inputState.operator)) cancel(cm);
     },
     uninstall() {
+      tables.cancel();
       prefixes.cancelAll();
       for (const cm of [...sessions.keys()]) cancel(cm);
       enabled = false;

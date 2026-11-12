@@ -1,6 +1,7 @@
 import { Plugin, Notice } from 'obsidian';
 import { Transaction } from '@codemirror/state';
 import { isolateHistory } from '@codemirror/commands';
+import { EditorView, ViewPlugin } from '@codemirror/view';
 import { installVimExtensions } from './vim.js';
 import { runSmoke } from './smoke.js';
 import { normalizeSettings, objectMappings } from './object-settings.js';
@@ -13,6 +14,29 @@ export default class VimEditingExtensions extends Plugin {
     this.disposed = false;
     this.reported = false;
     this.keyEvents = new WeakMap();
+    this.tableRanges = new Map();
+    const plugin = this;
+    this.registerEditorExtension([
+      EditorView.baseTheme({
+        '.vee-table-selection': { outline: '2px solid var(--interactive-accent)', outlineOffset: '2px' },
+        '.vee-table-selection td, .vee-table-selection th': { backgroundColor: 'var(--text-selection)' },
+      }),
+      ViewPlugin.fromClass(class {
+        constructor(view) { this.view = view; }
+        update(update) {
+          if (update.docChanged && plugin.tableRanges.has(update.view)) {
+            const previous = plugin.tableRanges.get(update.view);
+            queueMicrotask(() => {
+              if (plugin.tableRanges.get(update.view) === previous) {
+                for (const controller of plugin.controllers.values()) controller.cancelTables();
+              }
+            });
+          }
+          if (plugin.tableRanges.has(update.view)) update.view.requestMeasure({ key: this, read() {}, write: () => plugin.paintTableDOM(update.view) });
+        }
+        destroy() { plugin.tableRanges.delete(this.view); }
+      }),
+    ]);
     this.settings = normalizeSettings(await this.loadData());
     try { objectMappings(this.settings); } catch (error) {
       this.settings = normalizeSettings();
@@ -45,6 +69,37 @@ export default class VimEditingExtensions extends Plugin {
 
   getCM(view) { return view?.editMode?.editor?.cm?.cm ?? view?.editor?.cm?.cm; }
 
+  tableContext(cm) {
+    const root = this.getCM(this.app.workspace.activeLeaf?.view);
+    if (!root || (root !== cm && !root.cm6?.dom.contains(cm.cm6?.dom))) return null;
+    return { root, at: root.indexFromPos(root.getCursor()) };
+  }
+
+  paintTable(root, range) {
+    const view = root.cm6;
+    if (range) {
+      this.tableRanges.set(view, range);
+      if (this.app.workspace.activeLeaf?.view.getState().source) {
+        root.setSelection(root.posFromIndex(range.from), root.posFromIndex(range.to));
+      }
+    } else this.tableRanges.delete(view);
+    view.requestMeasure({ key: this, read() {}, write: () => this.paintTableDOM(view) });
+  }
+
+  paintTableDOM(view) {
+    const range = this.tableRanges.get(view);
+    for (const table of view.dom.querySelectorAll('table')) {
+      let selected = false;
+      if (range) {
+        try {
+          const at = view.posAtDOM(table);
+          selected = at >= range.tableFrom && at < range.tableTo;
+        } catch { /* An unrelated/non-editor widget has no source position. */ }
+      }
+      table.classList.toggle('vee-table-selection', selected);
+    }
+  }
+
   async updateSettings(settings) {
     const next = normalizeSettings(settings);
     objectMappings(next);
@@ -74,6 +129,8 @@ export default class VimEditingExtensions extends Plugin {
           notify: text => new Notice(text),
           isCurrent: cm => this.getCM(this.app.workspace.activeLeaf?.view) === cm,
           getEvent: () => this.keyEvents.get(win),
+          tableContext: cm => this.tableContext(cm),
+          paintTable: (cm, range) => this.paintTable(cm, range),
           prompt: (cm, request) => this.prompt(cm, request),
           applyEdit: (cm, edit) => this.applyEdit(cm, edit),
         });
@@ -82,9 +139,10 @@ export default class VimEditingExtensions extends Plugin {
         this.keyWindows ??= new WeakSet();
         if (!this.keyWindows.has(win)) {
           const cancel = () => this.controllers.get(V)?.cancelPrefixes();
+          const cancelTables = () => this.controllers.get(V)?.cancelTables();
           this.registerDomEvent(win, 'keydown', event => {
             if (isForwardedKey(event)) return;
-            if (event.isComposing || event.keyCode === 229) { cancel(); return; }
+            if (event.isComposing || event.keyCode === 229) { cancel(); cancelTables(); return; }
             this.keyEvents.set(win, event);
             const cm = this.getCM(this.app.workspace.activeLeaf?.view);
             // Native event dispatch can run microtasks between capture and
@@ -97,9 +155,16 @@ export default class VimEditingExtensions extends Plugin {
             }, 0);
           }, true);
           this.registerDomEvent(win, 'blur', cancel);
+          this.registerDomEvent(win, 'blur', cancelTables);
           this.registerDomEvent(win.document, 'pointerdown', cancel, true);
+          this.registerDomEvent(win.document, 'pointerdown', cancelTables, true);
           this.registerDomEvent(win.document, 'compositionstart', cancel, true);
+          this.registerDomEvent(win.document, 'compositionstart', cancelTables, true);
           this.registerDomEvent(win.document, 'focusin', cancel, true);
+          this.registerDomEvent(win.document, 'focusin', event => {
+            const root = this.getCM(this.app.workspace.activeLeaf?.view);
+            if (!root?.cm6?.dom.contains(event.target)) cancelTables();
+          }, true);
         }
         this.keyWindows.add(win);
       } catch (error) {

@@ -22,6 +22,14 @@ Extend Obsidian's **built-in Vim mode** with automatic quote/surrounding text ob
 
 Supports characterwise and linewise visual selections, nesting, counts, registers for text-object operators, single-step undo, redo, and native dot-repeat for surround and register replacement. `Esc` cancels pending input.
 
+### Markdown tables (0.4.0)
+
+`viT` selects the complete current pipe table; `yiT`, or `y` after `viT`, yanks its Markdown header, delimiter row and all body rows as linewise text. It works from a header or body cell in live preview as well as from source mode. The uppercase `T` preserves native lowercase `it/at` tag objects and `ip/ap` paragraph objects. `aT` also includes one adjacent blank line when available. Named/append/black-hole registers retain native yank behavior, for example `"ayiT` or `viT"ay`.
+
+Live-preview table selection uses a dedicated whole-table highlight and a document range independent of nested cell selections. Use Vim `y` to copy this selection; system clipboard behavior follows the host's existing Vim configuration. Esc, another key, a pointer interaction, leaving the editor, a document change, settings changes or unloading cancel the selection. This first version supports selection and yank of one table; editing operators and counts are rejected. Ordinary pipe tables are supported; HTML tables and tables nested in block quotes/indented code are excluded.
+
+The **Markdown table selection and yank** group and the **Markdown table** identifier control this feature. If an existing custom object already uses `T`, the new table identifier starts disabled to preserve that binding.
+
 ### Extended objects (0.3.0)
 
 | Objects | Meaning |

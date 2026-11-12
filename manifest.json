@@ -1,7 +1,7 @@
 {
   "id": "vim-editing-extensions",
   "name": "Vim Editing Extensions",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minAppVersion": "1.14.5",
   "description": "Extended Vim text objects, object navigation, sandwich-style surround edits, and register replacement for the built-in Vim mode.",
   "author": "xczs666",

@@ -123,4 +123,6 @@ test('settings validate complete binding sets and optional mappings stay opt-in'
   assert.ok(!objectMappings({ bindings: { L: '' } }).some(m => m.keys === 'iL'));
   assert.ok(objectMappings({ url: true, whitespace: true, buffer: true }).some(m => m.keys === 'I('));
   assert.equal(normalizeSettings({ groups: { separators: false } }).groups.subword, true);
+  assert.equal(normalizeSettings({ bindings: { L: 'T' } }).bindings.T, '');
+  assert.doesNotThrow(() => objectMappings({ bindings: { L: 'T' } }));
 });

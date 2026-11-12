@@ -1,5 +1,23 @@
 # Validation
 
+## Public release 0.4.0
+
+Validation date: 2026-11-12. This version was installed and validated locally before publication.
+
+| Check | Result |
+| --- | --- |
+| Portable reference-engine, resolver and table-range tests | 66 / 66 passed |
+| Obsidian 1.15.0 bundled-engine integration tests | 44 / 44 passed |
+| Obsidian 1.14.5 bundled-engine integration tests | 44 / 44 passed |
+| Running Obsidian 1.15.0 source/live-preview compatibility checks | 178 / 178 passed |
+| Physical live-preview header viT highlight and delayed y | Passed; register and clipboard contain complete Markdown |
+| Physical live-preview body-cell yiT | Passed; register and clipboard contain complete Markdown |
+| Physical Esc cancellation | Passed; whole-table highlight removed |
+
+The regression covers a table selection surviving the loss/replacement of a nested cell's native visual selection before the copy key. Physical checks used rendered header/body cell editors with real key events and time between selection and yank. The app stayed in live preview. Source and live-preview command checks also exercise a delayed copy. The temporary notes were saved and moved to vault trash; register, macro and clipboard state used by the checks was restored. Local reports contain generated fixtures only.
+
+Table parsing checks cover optional outer pipes, escaped pipes, alignment markers, exact source preservation, CRLF/EOF, missing body cells, frontmatter, fenced/indented code and following block boundaries. Runtime checks include linewise/default/named/append/black-hole registers, native lowercase tag/paragraph mapping preservation, remapping, cancellation, stale documents, counts and unsupported editing rejection. This version supports one ordinary Markdown pipe table for selection and yank; HTML tables, block-quote tables, table editing and counts are outside this addition.
+
 ## Public release 0.3.0
 
 Validation date: 2026-11-12. This version was installed and validated locally before publication.

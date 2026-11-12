@@ -1,6 +1,6 @@
 {
   "name": "vim-editing-extensions",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -8,7 +8,9 @@
     "type": "git",
     "url": "https://github.com/xczs666/obsidian-vim-editing-extensions.git"
   },
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "build": "node scripts/build.mjs",
     "test": "node --test test/*.test.js",

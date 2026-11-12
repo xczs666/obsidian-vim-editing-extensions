@@ -22,6 +22,38 @@ Extend Obsidian's **built-in Vim mode** with automatic quote/surrounding text ob
 
 Supports characterwise and linewise visual selections, nesting, counts, registers for text-object operators, single-step undo, redo, and native dot-repeat for surround and register replacement. `Esc` cancels pending input.
 
+### Extended objects (0.3.0)
+
+| Objects | Meaning |
+| --- | --- |
+| `iX/aX`, where X is space or `_ , - . ; : + = ~ * / \\ \| & $` | Literal separator segments, including first/last segments on a line |
+| `iL/aL` | Current line without/with indentation and trailing spaces, excluding the final newline |
+| `iS/aS` | Subword: snake_case, kebab-case, camelCase, acronyms and digits |
+| `iD/aD` | Inside/around `[[double brackets]]`; an embed's leading `!` is excluded |
+| `io/ao` | Automatic `()`, `[]`, `{}` only; `ib/ab` retain their wider matching |
+| `ii/iI`, `ai/aI`, `ig/ag` | Inner indentation, indentation plus upper/upper-and-lower border, and greedy indentation |
+| `ik/ak`, `iv/av` | A single-line key/value in structured regions or ordinary source text |
+| `ia/aa` | Arguments, ignoring commas in nested containers and escaped strings |
+| `if/af` | Contents of a function call / callable name plus parentheses |
+| `i?/a?` | Prompt for literal left/right boundaries, including multi-character boundaries |
+| `inX/anX`, `ilX/alX` | Next/previous object, explicitly searching across lines |
+
+For example, in `foo_bar`, `vi_` selects `foo` or `bar`; `va_` includes the right separator, falling back to the left at the end. Repeated separator characters form one boundary. A line must contain the requested separator; no match leaves the document and previous repeat unchanged. `i,` is a literal comma segment, **not** an argument; use `ia`. No `#` object is registered.
+
+Counts combine adjacent segments/subwords/lines, or select enclosing nested objects. Repeating an object in visual mode grows the selection and stops at its boundary. `v2inq` selects the second next quote. Existing native direct bracket/quote/tag objects remain native; the extension adds their next/previous forms.
+
+Key/value objects accept `label: value` and `key=value`, including ordinary prose labels. `ik/iv` exclude surrounding whitespace but keep the token's own quotes; `ak` includes the assignment separator, `av` includes a trailing comma/semicolon. Bare URLs, times and comparison expressions are excluded. Multiline values and multiple fields on one line are unsupported. Known fenced-code/frontmatter comments are excluded; ordinary prose `#tags` are retained.
+
+Arguments/calls use lexical bracket and quote matching, not a language grammar. Function definitions, language-specific generics, regular expressions and template interpolation are outside this feature's guarantees. Indentation uses the editor tab width and does not cross frontmatter/fence boundaries. Blank lines delimit zero-indent blocks.
+
+### Settings and optional mappings
+
+The settings tab provides independent object groups and editable identifiers. Empty identifiers disable an object; duplicate/reserved identifiers are rejected when **Save bindings** is pressed. Identifiers such as `_` can be remapped without editing the Vimrc. Changes cancel pending prompts and replace only the plugin's own mappings.
+
+Three optional groups default to **off**: URL object `L`, whitespace variants `IX/AX`, and entire-document object `gG`. Enable them in settings if wanted. `I` trims inner whitespace; `A` includes both boundaries and adjacent horizontal whitespace. When enabled, visual `I/A` wait for an object identifier; `Esc` cancels. Normal-mode `I/A/L` and native block insert stay unchanged. URL `L` and `gG` work only in visual/operator-pending contexts.
+
+Custom boundary prompts never interpret regular expressions or execute source. `.` reuses the accepted boundaries without prompting; cancellation, a document change or a leaf switch invalidates pending input. Local `data.json` is ignored and never included in release assets.
+
 ### Register replacement
 
 Yank text with `yiw`, move to a target word, then type `griw`. Keep using `griw` or `.` to replace further targets without losing the copied text. Prefix a register name to choose a source, for example `"agriw` or `"0griw`; uppercase letters read the corresponding lowercase register. Dot-repeat reuses the source register name and reads its **current** contents. Counts enlarge the target range, not the inserted text; visual repeats reuse the selection's dimensions.
@@ -42,7 +74,13 @@ Requires desktop Obsidian **1.14.5 or later** and built-in Vim key bindings enab
 2. Create `<vault>/.obsidian/plugins/vim-editing-extensions/` and copy both files into it.
 3. Reload installed plugins in **Settings → Community plugins**, then enable **Vim Editing Extensions**.
 
-While enabled, `s` is reserved as a multi-key prefix; its usual single-key substitution action waits for another key. Disabling the plugin restores the original single-key mapping. Existing multi-key mappings such as `s"` from Vimrc Support can still be used; they are not installed by this plugin. The plugin does not modify your Vimrc.
+### Prefix timeout
+
+Set **Prefix timeout (ms)** in this plugin's settings and click **Apply timeout**. `100` waits up to 100 ms for the next key; `0` (the default) waits indefinitely. This applies only to prefixes deferred by this plugin: `s`, optional visual `I/A`, and `n/l` after an object prefix. It does not change every Vim mapping or Obsidian hotkey.
+
+A timely match continues the combination. For example, once `sd` or `sa` matches, the remaining target or motion has no timer. On timeout, the original shorter mapping runs once. On a mismatch, that shorter mapping runs and the remaining key is offered to the host, then to its normal Vim dispatcher if unhandled. Native `s` therefore substitutes a character and enters insert mode; a custom single-key mapping runs its configured action. The plugin has no dependency on the action's provider. DOM key handoff uses a synthetic event, so handlers requiring trusted browser events cannot be guaranteed.
+
+`Esc`, focus/leaf changes, pointer interaction, IME composition, changed document/selection, settings changes and unloading cancel a pending prefix without executing it. Existing multi-key mappings such as `s"` from Vimrc Support still work. Disabling restores the original single-key mapping; this plugin does not modify your Vimrc.
 
 ## Matching and limitations
 
@@ -50,7 +88,7 @@ While enabled, `s` is reserved as a multi-key prefix; its usual single-key subst
 - Brackets and complete tags may span lines; quote pairs are matched within one line and honor backslash escapes.
 - Tags support attributes, quoted `>` characters and nested same-name elements. Self-closing/void tags cannot wrap content.
 - Matching operates on Markdown **source text**, without a language parser or HTML execution. Angle brackets are also treated as literal delimiter pairs; explicitly select a tag with `t` when that distinction matters.
-- Function/argument objects, arbitrary delimiter prompts, next/previous object search, blockwise selections, multiple cursors and macros are outside the first release's scope.
+- Blockwise selection editing, multiple cursors, macros, language-grammar text objects, folds, viewport objects and diagnostics are outside this release. Existing native block insertion is preserved.
 - Integration uses Obsidian's undocumented Vim adapter. Updates to Obsidian may require a plugin update. Missing required interfaces prevent registration and produce a diagnostic notice.
 
 ## Privacy

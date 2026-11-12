@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0
+
+- Add configurable prefix timeout (0 means unlimited), original-mapping fallback on timeout/mismatch, and generic remaining-key handoff without depending on another plugin.
+- Add literal separator segments, line/subword/double-bracket objects, automatic bracket aliases, indentation, keys/values, arguments and function calls.
+- Add counted next/previous object navigation and incremental visual selection.
+- Add literal custom-boundary prompts with cancellation and repeat protection.
+- Add object-group settings, configurable identifiers and opt-in URL, whitespace and whole-document mappings.
+- Keep `_` for underscore segments, `,` for literal comma segments, `a` for arguments and `L` for line objects after i/a.
+- Retain native surround/register behavior, named-register copying and ordinary/block insert mappings.
+
 ## 0.2.0
 
 - Add `gr{motion}`, `grr`, counted replacements and characterwise/linewise visual replacement.

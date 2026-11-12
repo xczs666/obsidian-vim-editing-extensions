@@ -23,7 +23,7 @@ __export(main_exports, {
   default: () => VimEditingExtensions
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian = require("obsidian");
+var import_obsidian2 = require("obsidian");
 var import_state = require("@codemirror/state");
 var import_commands = require("@codemirror/commands");
 
@@ -108,11 +108,11 @@ function collectPairs(text) {
   }
   return result;
 }
-function matchesType(candidate, type) {
+function matchesType(candidate2, type) {
   if (type === "b") return true;
-  if (type === "q") return ['"', "'", "`"].includes(candidate.kind);
-  if (type === "t" || type === "T") return candidate.kind === "t";
-  return candidate.kind === DELIMITERS[type]?.[0];
+  if (type === "q") return ['"', "'", "`"].includes(candidate2.kind);
+  if (type === "t" || type === "T") return candidate2.kind === "t";
+  return candidate2.kind === DELIMITERS[type]?.[0];
 }
 function findPair(text, start, end = start, type = "b", count = 1, exclude = null) {
   const pairs = collectPairs(text).filter((p) => matchesType(p, type));
@@ -129,12 +129,12 @@ function tagPair(input) {
   if (!match || /[\r\n]/.test(value) || /\/\s*$/.test(value) || VOID_TAGS.has(match[1].toLowerCase())) return null;
   return [`<${value}>`, `</${match[1]}>`];
 }
-function editPair(text, candidate, replacement = ["", ""]) {
+function editPair(text, candidate2, replacement = ["", ""]) {
   return {
-    from: candidate.start,
-    to: candidate.end,
-    insert: replacement[0] + text.slice(candidate.innerStart, candidate.innerEnd) + replacement[1],
-    cursor: candidate.start
+    from: candidate2.start,
+    to: candidate2.end,
+    insert: replacement[0] + text.slice(candidate2.innerStart, candidate2.innerEnd) + replacement[1],
+    cursor: candidate2.start
   };
 }
 function wrapRange(text, from, to, replacement, count = 1, linewise = false) {
@@ -183,11 +183,614 @@ function registerEdit(text, from, to, value, registerLinewise, linewise) {
   return { from, to, insert, cursor };
 }
 
+// src/objects.js
+var SEPARATORS = [" ", "_", ",", "-", ".", ";", ":", "+", "=", "~", "*", "/", "\\", "|", "&", "$"];
+var horizontal = (c) => c != null && /[\t ]/.test(c);
+var escaped2 = (text, at) => {
+  let n = 0;
+  while (at > 0 && text[--at] === "\\") n++;
+  return n % 2 === 1;
+};
+var candidate = (from, to, innerFrom = from, innerTo = to, extra = {}) => ({ from, to, innerFrom, innerTo, aroundFrom: from, aroundTo: to, coverFrom: from, coverTo: to, ...extra });
+function linesOf(text, tabSize) {
+  let offset = 0;
+  const lines = text.split("\n").map((value) => {
+    let indent = 0;
+    for (const ch of value.match(/^[\t ]*/)[0]) indent += ch === "	" ? tabSize - indent % tabSize : 1;
+    const row = { value, from: offset, to: offset + value.length, indent, blank: !value.trim() };
+    offset += value.length + 1;
+    return row;
+  });
+  let scope = 0, fence = null, language = "", frontmatter = lines[0]?.value === "---";
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i];
+    row.language = frontmatter ? "yaml" : language;
+    if (frontmatter && (i === 0 || /^(---|\.\.\.)\s*$/.test(row.value))) {
+      row.scope = null;
+      if (i > 0) frontmatter = false;
+      scope++;
+      continue;
+    }
+    const token = row.value.match(/^ {0,3}(`{3,}|~{3,})(.*)$/);
+    if (token && (!fence || token[1][0] === fence[0] && token[1].length >= fence.length && !token[2].trim())) {
+      row.scope = null;
+      language = fence ? "" : token[2].trim().split(/\s/)[0].toLowerCase();
+      fence = fence ? null : token[1];
+      scope++;
+      continue;
+    }
+    row.scope = scope;
+  }
+  return lines;
+}
+function structures(text) {
+  const brackets = [], strings = [], stack = [];
+  let quote = null, quoteStart = 0;
+  const closing = { ")": "(", "]": "[", "}": "{" };
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === quote && !escaped2(text, i)) {
+        strings.push({ from: quoteStart, to: i + 1 });
+        quote = null;
+      } else if (ch === "\n" && quote !== "`") {
+        for (const item of stack) item.invalid = true;
+        quote = null;
+      }
+      continue;
+    }
+    if ("'\"`".includes(ch) && !escaped2(text, i)) {
+      quote = ch;
+      quoteStart = i;
+      continue;
+    }
+    if ("([{".includes(ch)) stack.push({ ch, from: i });
+    else if (closing[ch]) {
+      const open = stack.pop();
+      if (!open || open.ch !== closing[ch]) {
+        for (const item of stack) item.invalid = true;
+        continue;
+      }
+      if (!open.invalid) brackets.push({ from: open.from, to: i + 1, ch: open.ch });
+    }
+  }
+  return { brackets, strings };
+}
+function segments(text, start, end, runs, group) {
+  const result = [];
+  let from = start, left = null;
+  for (let i = 0; i <= runs.length; i++) {
+    const right = runs[i];
+    const to = right?.from ?? end;
+    if (to > from) result.push(candidate(left?.from ?? from, right?.to ?? to, from, to, {
+      aroundFrom: right ? from : left?.from ?? from,
+      aroundTo: right?.to ?? to,
+      coverFrom: left?.from ?? from,
+      coverTo: to,
+      group,
+      flat: true,
+      boundaryStyle: true,
+      rightBoundary: !!right,
+      leftBoundaryFrom: left?.from ?? from
+    }));
+    if (right) {
+      from = right.to;
+      left = right;
+    }
+  }
+  return result;
+}
+function separatorObjects(text, delimiter, lines) {
+  return lines.flatMap((row) => {
+    const runs = [];
+    for (let i = row.from; i < row.to; i++) {
+      if (text[i] !== delimiter) continue;
+      const from = i;
+      while (text[i + 1] === delimiter) i++;
+      runs.push({ from, to: i + 1 });
+    }
+    return runs.length ? segments(text, row.from, row.to, runs, row.from) : [];
+  });
+}
+function subwords(text, lines) {
+  const result = [];
+  for (const row of lines) {
+    for (const match of row.value.matchAll(/[\p{L}\p{N}]+/gu)) {
+      const chars = [...match[0]], cuts = [0];
+      let offset = 0;
+      for (let i = 0; i < chars.length; i++) {
+        const a = chars[i - 1], b = chars[i], c = chars[i + 1];
+        if (i && (/\p{Ll}/u.test(a) && /\p{Lu}/u.test(b) || /\p{Lu}/u.test(a) && /\p{Lu}/u.test(b) && c && /\p{Ll}/u.test(c) || /\p{N}/u.test(a) !== /\p{N}/u.test(b))) cuts.push(offset);
+        offset += b.length;
+      }
+      cuts.push(offset);
+      for (let i = 0; i < cuts.length - 1; i++) {
+        const from = row.from + match.index + cuts[i], to = row.from + match.index + cuts[i + 1];
+        let left = from, right = to;
+        while (right < row.to && /[_.\-\t ]/.test(text[right])) right++;
+        if (right === to) while (left > row.from && /[_.\-\t ]/.test(text[left - 1])) left--;
+        result.push(candidate(from, to, from, to, { aroundFrom: left, aroundTo: right, flat: true, group: row.from }));
+      }
+    }
+  }
+  return result;
+}
+function argumentObjects(text, lex) {
+  const skip = new Map([...lex.brackets, ...lex.strings].map((p) => [p.from, p.to]));
+  return lex.brackets.flatMap((container) => {
+    const commas = [];
+    for (let i = container.from + 1; i < container.to - 1; i++) {
+      if (skip.has(i)) {
+        i = skip.get(i) - 1;
+        continue;
+      }
+      if (text[i] === ",") commas.push(i);
+    }
+    const bounds = [container.from, ...commas, container.to - 1];
+    return bounds.slice(0, -1).map((left, i) => {
+      const right = bounds[i + 1];
+      let from = left + 1, to = right;
+      while (from < to && /\s/.test(text[from])) from++;
+      while (to > from && /\s/.test(text[to - 1])) to--;
+      let aroundFrom = from, aroundTo = to;
+      if (i < commas.length) {
+        aroundTo = right + 1;
+        while (aroundTo < container.to - 1 && /\s/.test(text[aroundTo])) aroundTo++;
+      } else if (i > 0) aroundFrom = left;
+      return candidate(left + 1, right, from, to, {
+        aroundFrom,
+        aroundTo,
+        coverFrom: i ? left : container.from,
+        coverTo: right,
+        flat: true,
+        group: container.from,
+        boundaryStyle: true,
+        rightBoundary: i < commas.length,
+        leftBoundaryFrom: i ? left : from
+      });
+    });
+  });
+}
+function callObjects(text, lex) {
+  return lex.brackets.filter((p) => p.ch === "(").flatMap((p) => {
+    const match = text.slice(0, p.from).match(/([\p{L}_$][\p{L}\p{N}_$]*(?:\.[\p{L}_$][\p{L}\p{N}_$]*)*)[\t ]*$/u);
+    if (!match || /^(if|for|while|switch|catch|with)$/.test(match[1])) return [];
+    const from = p.from - match[0].length;
+    if (/(?:\bfunction|\bclass|\bdef)\s+$/.test(text.slice(0, from)) || /^\s*(?:=>|\{)/.test(text.slice(p.to))) return [];
+    return [candidate(from, p.to, p.from + 1, p.to - 1)];
+  });
+}
+function keyValues(text, lines, id) {
+  return lines.flatMap((row) => {
+    let from = row.from + row.value.match(/^[\t ]*(?:- )?/)[0].length, to = row.to;
+    while (to > from && horizontal(text[to - 1])) to--;
+    if (text[from] === "{" && text[to - 1] === "}") {
+      from++;
+      to--;
+    }
+    const splits = [];
+    const commentAt = (at) => text[at] === "#" && ["yaml", "yml", "bash", "sh", "zsh", "python", "py"].includes(row.language) || text.startsWith("//", at) && ["js", "javascript", "ts", "typescript", "java", "c", "cpp", "go"].includes(row.language) || text.startsWith("--", at) && row.language === "sql";
+    let quote = null, depth = 0, comment = to;
+    for (let i = from; i < to; i++) {
+      const ch = text[i];
+      if (quote) {
+        if (ch === quote && !escaped2(text, i)) quote = null;
+        continue;
+      }
+      if ("'\"`".includes(ch) && !escaped2(text, i)) {
+        quote = ch;
+        continue;
+      }
+      if ("([{".includes(ch)) depth++;
+      else if (")]}".includes(ch)) depth--;
+      else if (!depth && horizontal(text[i - 1]) && commentAt(i)) {
+        comment = i;
+        break;
+      } else if (!depth && (ch === ":" || ch === "=")) {
+        if (splits.length && /^[\t ]*[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(text.slice(splits[0] + 1))) continue;
+        if (ch === ":" && splits.length) continue;
+        if (ch === ":" && text.slice(i + 1, i + 3) === "//") return [];
+        if (/[!<>=~:]/.test(text[i - 1] ?? "") || /[=>:]/.test(text[i + 1] ?? "")) return [];
+        splits.push(i);
+      } else if (!depth && (ch === "," || ch === ";") && text.slice(i + 1, to).trim()) {
+        const next = i + 1 + text.slice(i + 1, to).match(/^[\t ]*/)[0].length;
+        if (!commentAt(next)) return [];
+      }
+    }
+    if (quote || depth !== 0 || splits.length !== 1) return [];
+    const split = splits[0];
+    let keyFrom = from, keyTo = split, valueFrom = split + 1, valueTo = comment;
+    while (horizontal(text[keyFrom])) keyFrom++;
+    while (keyTo > keyFrom && horizontal(text[keyTo - 1])) keyTo--;
+    const key = text.slice(keyFrom, keyTo);
+    if (!key || !/[\p{L}_]/u.test(key) || !/^(?:[\p{L}\p{N}_.\-\t ]+|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/u.test(key)) return [];
+    while (valueFrom < valueTo && horizontal(text[valueFrom])) valueFrom++;
+    while (valueTo > valueFrom && horizontal(text[valueTo - 1])) valueTo--;
+    const outerTo = valueTo;
+    if (/[,;]/.test(text[valueTo - 1] ?? "")) valueTo--;
+    while (valueTo > valueFrom && horizontal(text[valueTo - 1])) valueTo--;
+    if (/^[|>][-+0-9]*$/.test(text.slice(valueFrom, valueTo))) return [];
+    return [id === "k" ? candidate(keyFrom, valueFrom, keyFrom, keyTo, { coverFrom: row.from, coverTo: row.to }) : candidate(valueFrom, outerTo, valueFrom, valueTo, { coverFrom: row.from, coverTo: row.to })];
+  });
+}
+function indentation(text, lines, id) {
+  const result = /* @__PURE__ */ new Map(), seen = /* @__PURE__ */ new Set();
+  const bounds = /* @__PURE__ */ new Map(), lowerLeft = [], lowerRight = [], blankLeft = [], blankRight = [];
+  for (let i = 0; i < lines.length; i++) {
+    const scope = lines[i].scope;
+    if (scope != null) {
+      if (!bounds.has(scope)) bounds.set(scope, [i, i]);
+      else bounds.get(scope)[1] = i;
+    }
+  }
+  for (const forward of [true, false]) {
+    let stack = [], scope, blank = forward ? -1 : lines.length;
+    for (let step = 0; step < lines.length; step++) {
+      const i = forward ? step : lines.length - step - 1, row = lines[i];
+      if (row.scope == null || row.scope !== scope) {
+        stack = [];
+        scope = row.scope;
+      }
+      if (row.blank || row.scope == null) blank = i;
+      (forward ? blankLeft : blankRight)[i] = blank;
+      if (row.blank || row.scope == null) continue;
+      while (stack.length && lines[stack.at(-1)].indent >= row.indent) stack.pop();
+      const edge = bounds.get(row.scope);
+      (forward ? lowerLeft : lowerRight)[i] = stack.at(-1) ?? (forward ? edge[0] - 1 : edge[1] + 1);
+      stack.push(i);
+    }
+  }
+  for (let i = 0; i < lines.length; i++) {
+    const row = lines[i];
+    if (row.blank || row.scope == null) continue;
+    let lo = lowerLeft[i] + 1, hi = lowerRight[i] - 1;
+    const within = (j) => j >= 0 && j < lines.length && lines[j].scope === row.scope;
+    if (!row.indent) {
+      lo = Math.max(lo, blankLeft[i] + 1);
+      hi = Math.min(hi, blankRight[i] - 1);
+    }
+    while (lines[lo]?.blank) lo++;
+    while (lines[hi]?.blank) hi--;
+    const blockKey = `${row.scope}:${lo}:${hi}`;
+    if (seen.has(blockKey)) continue;
+    seen.add(blockKey);
+    let outerLo = within(lo - 1) ? lo - 1 : lo, outerHi = id === "I" && within(hi + 1) ? hi + 1 : hi;
+    if (id === "g") {
+      const first = lines[outerLo].blank ? lo : outerLo;
+      const next = within(hi + 1) && !lines[hi + 1].blank ? hi + 1 : hi;
+      lo = Math.max(bounds.get(row.scope)[0], blankLeft[first] + 1);
+      hi = Math.min(bounds.get(row.scope)[1], blankRight[next] - 1);
+      outerLo = lo;
+      outerHi = hi;
+      if (within(hi + 1) && lines[hi + 1].blank) outerHi++;
+      else if (within(lo - 1) && lines[lo - 1].blank) outerLo--;
+    }
+    const after = (j) => Math.min(text.length, lines[j].to + 1);
+    const p = candidate(lines[outerLo].from, after(outerHi), lines[lo].from, after(hi), { linewise: true, coverFrom: lines[lo].from, coverTo: after(hi) });
+    result.set([p.from, p.to, p.innerFrom, p.innerTo].join(":"), p);
+  }
+  return [...result.values()];
+}
+function literalPairs(text, left, right) {
+  if (!left || !right || /[\r\n]/.test(left + right)) return [];
+  const result = [], stack = [];
+  for (let i = 0; i < text.length; ) {
+    if (left === right && text.startsWith(left, i)) {
+      if (stack.length) {
+        const open = stack.pop();
+        result.push(candidate(open, i + right.length, open + left.length, i));
+      } else stack.push(i);
+      i += left.length;
+    } else if (text.startsWith(right, i) && stack.length) {
+      const open = stack.pop();
+      result.push(candidate(open, i + right.length, open + left.length, i));
+      i += right.length;
+    } else if (text.startsWith(left, i)) {
+      stack.push(i);
+      i += left.length;
+    } else i++;
+  }
+  return result;
+}
+function urls(text) {
+  return [...text.matchAll(/[A-Za-z][A-Za-z0-9+.-]*:\/\/[^\s<>"'`]+/g)].map((match) => {
+    let value = match[0];
+    for (; ; ) {
+      while (/[.,;:!?，。；：！？]$/.test(value)) value = value.slice(0, -1);
+      const close = value.at(-1), open = { ")": "(", "]": "[", "}": "{" }[close];
+      if (!open || [...value].filter((c) => c === close).length <= [...value].filter((c) => c === open).length) break;
+      value = value.slice(0, -1);
+    }
+    return candidate(match.index, match.index + value.length);
+  });
+}
+function candidates(text, request) {
+  const { id } = request;
+  const lines = linesOf(text, request.tabSize || 4);
+  if (id.startsWith("sep:")) return separatorObjects(text, id.slice(4), lines);
+  if (id === "S") return subwords(text, lines);
+  if (id === "L") return lines.map((row) => {
+    const leading = row.value.match(/^[\t ]*/)[0].length;
+    const trailing = row.value.match(/[\t ]*$/)[0].length;
+    return candidate(row.from, row.to, row.from + leading, Math.max(row.from + leading, row.to - trailing), { flat: true, group: "lines" });
+  });
+  if (id === "i" || id === "I" || id === "g") return indentation(text, lines, id);
+  if (id === "k" || id === "v") return keyValues(text, lines, id);
+  if (id === "a" || id === "f") {
+    const lex = structures(text);
+    return id === "a" ? argumentObjects(text, lex) : callObjects(text, lex);
+  }
+  if (id === "?") return literalPairs(text, ...request.markers ?? []);
+  if (id === "url") return urls(text);
+  if (id === "buffer") return [candidate(0, text.length, 0, text.length, { linewise: true })];
+  const pairs = collectPairs(text);
+  if (id === "D") return literalPairs(text, "[[", "]]");
+  return pairs.filter((p) => id === "b" || id === "q" && ['"', "'", "`"].includes(p.kind) || id === "o" && ["(", "[", "{"].includes(p.kind) || id.startsWith("pair:") && p.kind === ({ ")": "(", "]": "[", "}": "{", ">": "<", B: "{" }[id.slice(5)] ?? id.slice(5))).map((p) => candidate(p.start, p.end, p.innerStart, p.innerEnd));
+}
+function region(text, p, variant) {
+  let from = variant === "i" || variant === "I" ? p.innerFrom : variant === "a" ? p.aroundFrom : p.from;
+  let to = variant === "i" || variant === "I" ? p.innerTo : variant === "a" ? p.aroundTo : p.to;
+  if (variant === "I") {
+    while (from < to && /\s/.test(text[from])) from++;
+    while (to > from && /\s/.test(text[to - 1])) to--;
+  } else if (variant === "A") {
+    while (horizontal(text[to])) to++;
+    if (to === p.to) while (from > 0 && horizontal(text[from - 1])) from--;
+  }
+  return { from, to, linewise: !!p.linewise };
+}
+function resolveObject(text, request) {
+  const { id, head = 0, selection, expand = false, variant = "i", direction = "current" } = request;
+  const count = Math.max(1, request.count || 1);
+  const all = candidates(text, request);
+  const position = selection?.from ?? head;
+  const end = selection?.to ?? head;
+  if (direction !== "current") {
+    const forward = direction === "next";
+    const distant = all.filter((p) => forward ? p.coverFrom > end || selection && p.coverFrom === end : p.coverTo <= position).sort((a, b) => forward ? a.coverFrom - b.coverFrom || a.to - a.from - (b.to - b.from) : b.coverTo - a.coverTo || a.to - a.from - (b.to - b.from));
+    return distant[count - 1] ? region(text, distant[count - 1], variant) : null;
+  }
+  let matching = all.filter((p) => p.coverFrom <= head && (head < p.coverTo || head === text.length && p.coverTo === head || p.coverFrom === p.coverTo && p.coverFrom === head));
+  if (expand && selection) {
+    matching = all.filter((p) => {
+      const r = region(text, p, variant);
+      if (p.flat) return r.from === selection.from;
+      return r.from <= selection.from && r.to >= selection.to && (r.from < selection.from || r.to > selection.to || p.flat);
+    });
+  }
+  matching.sort((a, b) => a.to - a.from - (b.to - b.from) || b.from - a.from);
+  if (!matching.length && !expand) {
+    const lineEnd = text.indexOf("\n", head);
+    matching = all.filter((p) => p.coverFrom >= head && p.coverFrom <= (lineEnd < 0 ? text.length : lineEnd)).sort((a, b) => a.coverFrom - b.coverFrom || a.to - a.from - (b.to - b.from));
+  }
+  const first = matching[0];
+  if (!first) return null;
+  if (first.flat) {
+    const siblings = all.filter((p) => p.flat && p.group === first.group).sort((a, b) => a.innerFrom - b.innerFrom);
+    const start = siblings.indexOf(first);
+    let last = start + count - 1;
+    if (expand && selection) {
+      last = start;
+      while (last < siblings.length && region(text, siblings[last], variant).to <= selection.to) last++;
+      last += count - 1;
+    }
+    if (!siblings[last]) return null;
+    return region(text, {
+      ...first,
+      to: siblings[last].to,
+      innerTo: siblings[last].innerTo,
+      aroundFrom: first.boundaryStyle ? siblings[last].rightBoundary ? first.innerFrom : first.leftBoundaryFrom : first.aroundFrom,
+      aroundTo: siblings[last].aroundTo
+    }, variant);
+  }
+  const ordered = matching.filter((p) => p.coverFrom <= position && p.coverTo >= end);
+  const selected = (ordered.length ? ordered : matching)[count - 1];
+  if (!selected || id === "buffer" && count > 1) return null;
+  return region(text, selected, variant);
+}
+
+// src/object-settings.js
+var GROUPS = {
+  separators: "Separator text objects",
+  line: "Line text objects",
+  subword: "Subword text objects",
+  brackets: "Bracket aliases and double brackets",
+  indentation: "Indentation text objects",
+  keyValue: "Single-line keys and values",
+  arguments: "Arguments and function calls",
+  custom: "Custom boundary prompts"
+};
+var OPTIONAL = { url: "URL object (L)", whitespace: "Whitespace variants (I/A)", buffer: "Entire document (gG)" };
+var DEFAULT_SETTINGS = { groups: Object.fromEntries(Object.keys(GROUPS).map((k) => [k, true])), navigation: true, url: false, whitespace: false, buffer: false, prefixTimeoutMs: 0, bindings: {} };
+var OBJECTS = [
+  ...SEPARATORS.map((ch) => ({ id: "sep:" + ch, trigger: ch, group: "separators", whitespace: true, label: `Separator ${ch === " " ? "<Space>" : ch}` })),
+  ...[
+    ["L", "line", "Current line"],
+    ["S", "subword", "Subword"],
+    ["D", "brackets", "Double brackets"],
+    ["o", "brackets", "Automatic brackets"],
+    ["i", "indentation", "Indentation"],
+    ["I", "indentation", "Indentation with lower border"],
+    ["g", "indentation", "Greedy indentation"],
+    ["k", "keyValue", "Key"],
+    ["v", "keyValue", "Value"],
+    ["a", "arguments", "Argument"],
+    ["f", "arguments", "Function call"],
+    ["?", "custom", "Custom boundaries"]
+  ].map(([id, group, label]) => ({ id, group, label, trigger: id, whitespace: ["D", "o", "?"].includes(id) }))
+];
+function normalizeSettings(input = {}) {
+  input ??= {};
+  return { ...DEFAULT_SETTINGS, ...input, groups: { ...DEFAULT_SETTINGS.groups, ...input.groups }, bindings: { ...input.bindings } };
+}
+function objectMappings(input) {
+  const settings = normalizeSettings(input), result = [], used = /* @__PURE__ */ new Set();
+  if (!Number.isInteger(settings.prefixTimeoutMs) || settings.prefixTimeoutMs < 0 || settings.prefixTimeoutMs > 6e4) {
+    throw new Error("Prefix timeout must be an integer from 0 to 60000 ms (0 means unlimited).");
+  }
+  const descriptors = [
+    { id: "q", trigger: "q", whitespace: true },
+    { id: "b", trigger: "b", whitespace: true },
+    ...OBJECTS.map((o) => ({ ...o, trigger: settings.bindings[o.id] ?? o.trigger, disabled: !settings.groups[o.group] })),
+    ...["(", ")", "[", "]", "{", "}", "<", ">", '"', "'", "`", "t", "B"].map((ch) => ({ id: "pair:" + ch, trigger: ch, whitespace: true, native: true }))
+  ];
+  for (const item of descriptors) {
+    if (!item.trigger) continue;
+    const trigger = item.trigger === "<Space>" ? " " : item.trigger;
+    if ([...trigger].length !== 1 || /[\r\n]/.test(trigger) || !item.native && ["n", "l", "w", "W", "s", "p", "t", "B", "#", "(", ")", "[", "]", "{", "}", "<", ">", '"', "'", "`"].includes(trigger)) {
+      throw new Error(`Invalid or reserved text-object identifier: ${item.label ?? item.id}`);
+    }
+    if (used.has(trigger)) throw new Error(`Duplicate text-object identifier: ${trigger}`);
+    used.add(trigger);
+    if (item.disabled) continue;
+    const variants = ["i", "a", ...settings.whitespace && item.whitespace ? ["I", "A"] : []];
+    for (const variant of variants) for (const [modifier, direction] of [["", "current"], ...settings.navigation ? [["n", "next"], ["l", "previous"]] : []]) {
+      if (item.native && !modifier && (variant === "i" || variant === "a")) continue;
+      result.push({ keys: variant + modifier + (trigger === " " ? "<Space>" : trigger), id: item.id, variant, direction });
+      if (trigger === " ") result.push({ keys: variant + modifier + " ", id: item.id, variant, direction });
+    }
+  }
+  if (settings.url) result.push({ keys: "L", id: "url", variant: "a", direction: "current" });
+  if (settings.buffer) result.push({ keys: "gG", id: "buffer", variant: "a", direction: "current" });
+  return result;
+}
+
+// src/prefixes.js
+var forwarded = /* @__PURE__ */ new WeakSet();
+var isForwardedKey = (event) => forwarded.has(event);
+function cloneInput(input) {
+  const copy = Object.assign(Object.create(Object.getPrototypeOf(input)), input);
+  for (const key of ["keyBuffer", "prefixRepeat", "motionRepeat"]) if (input[key]) copy[key] = [...input[key]];
+  for (const key of ["motionArgs", "operatorArgs"]) if (input[key]) copy[key] = { ...input[key] };
+  return copy;
+}
+function prefixWait({ lookup, timeoutMs, isCurrent, getEvent = () => null }) {
+  const pending = /* @__PURE__ */ new Map();
+  let forwarding = false;
+  const selection = (cm) => JSON.stringify(cm.listSelections());
+  const owns = (cm, p) => cm.state.vim === p.vim && p.vim.inputState === p.input && p.input.keyBuffer.join("") === p.buffer;
+  function valid(cm, p) {
+    return owns(cm, p) && isCurrent(cm) && cm.getValue() === p.text && (!p.doc || cm.cm6?.state.doc === p.doc) && selection(cm) === p.selection && p.vim.insertMode === p.insertMode && p.vim.visualMode === p.visualMode && (!p.document || p.document.activeElement === p.focus);
+  }
+  function remove(cm) {
+    const p = pending.get(cm);
+    if (p) clearTimeout(p.timer);
+    pending.delete(cm);
+    return p;
+  }
+  function cancel(cm) {
+    const p = remove(cm);
+    if (p && owns(cm, p)) p.vim.inputState = new p.input.constructor();
+  }
+  function fallback(cm, p) {
+    cm.state.vim.inputState = cloneInput(p.before);
+    return lookup(cm, p.key, p.origin)?.();
+  }
+  function handoff(event) {
+    if (!event?.target?.dispatchEvent) return false;
+    const doc = event.target.ownerDocument;
+    const target = doc.activeElement && doc.activeElement !== doc.body ? doc.activeElement : event.target;
+    if (!target.isConnected) return false;
+    const copy = new doc.defaultView.KeyboardEvent(event.type, {
+      key: event.key,
+      code: event.code,
+      location: event.location,
+      repeat: event.repeat,
+      ctrlKey: event.ctrlKey,
+      metaKey: event.metaKey,
+      altKey: event.altKey,
+      shiftKey: event.shiftKey,
+      keyCode: event.keyCode,
+      which: event.which,
+      bubbles: true,
+      cancelable: true,
+      composed: true
+    });
+    let stopped = false;
+    for (const name of ["stopPropagation", "stopImmediatePropagation"]) {
+      const original = copy[name];
+      copy[name] = function() {
+        stopped = true;
+        return original.call(this);
+      };
+    }
+    forwarded.add(copy);
+    forwarding = true;
+    try {
+      target.dispatchEvent(copy);
+    } finally {
+      forwarding = false;
+    }
+    return copy.defaultPrevented || stopped;
+  }
+  return {
+    get forwarding() {
+      return forwarding;
+    },
+    defer(cm, key, origin) {
+      const vim = cm.state.vim, input = vim.inputState;
+      const event = origin === "user" ? getEvent(cm) : null;
+      const p = {
+        vim,
+        input,
+        before: cloneInput(input),
+        key,
+        origin,
+        text: cm.getValue(),
+        doc: cm.cm6?.state.doc,
+        selection: selection(cm),
+        insertMode: vim.insertMode,
+        visualMode: vim.visualMode,
+        document: event?.target?.ownerDocument,
+        deadline: timeoutMs ? Date.now() + timeoutMs : Infinity
+      };
+      p.focus = p.document?.activeElement;
+      input.keyBuffer.push(key);
+      p.buffer = input.keyBuffer.join("");
+      pending.set(cm, p);
+      if (timeoutMs) p.timer = setTimeout(() => {
+        if (pending.get(cm) !== p) return;
+        if (!valid(cm, p)) {
+          cancel(cm);
+          return;
+        }
+        remove(cm);
+        fallback(cm, p);
+      }, timeoutMs);
+      return () => true;
+    },
+    resolve(cm, key, origin) {
+      const p = pending.get(cm);
+      if (!p) return null;
+      if (["<Esc>", "<C-c>", "<C-[>"].includes(key) || !valid(cm, p)) {
+        cancel(cm);
+        return null;
+      }
+      remove(cm);
+      if (Date.now() < p.deadline) {
+        const handler = lookup(cm, key, origin);
+        if (cm.state.vim.inputState === p.input) return { handler };
+      }
+      const event = origin === "user" ? getEvent(cm) : null;
+      return { handler: () => {
+        fallback(cm, p);
+        if (handoff(event)) return true;
+        return lookup(cm, key, origin)?.();
+      } };
+    },
+    cancelAll() {
+      for (const cm of pending.keys()) cancel(cm);
+    },
+    hasPending: (cm) => pending.has(cm)
+  };
+}
+
 // src/vim.js
 var NAME = "vimEditingExtensions";
 var ADD = "<VEEAdd>";
 var COMMIT = "<VEECommit>";
 var REGISTER_REPLACE = NAME + "registerReplace";
+var OBJECT = "<VEEObject>";
 var copyPos = (p) => ({ line: p.line, ch: p.ch });
 function previousCharacter(text, end) {
   if (end <= 0) return 0;
@@ -203,31 +806,60 @@ function installVimExtensions(V, options) {
   const sessions = /* @__PURE__ */ new Map();
   const staged = /* @__PURE__ */ new WeakMap();
   const registerContexts = /* @__PURE__ */ new WeakMap();
+  const frames = /* @__PURE__ */ new WeakMap();
+  const visualObjects = /* @__PURE__ */ new WeakMap();
+  const resolvedPrompts = /* @__PURE__ */ new WeakMap();
+  const settings = normalizeSettings(options.settings);
+  const mappings = objectMappings(settings);
   const notify = options.notify ?? (() => {
   });
   const isCurrent = options.isCurrent ?? (() => true);
   const originalFindKey = V.findKey;
+  const prefixes = prefixWait({ lookup, timeoutMs: settings.prefixTimeoutMs, isCurrent, getEvent: options.getEvent });
   function findKey(cm, key, origin) {
+    if (prefixes.forwarding) return;
+    const pending = prefixes.resolve(cm, key, origin);
+    if (pending) return pending.handler;
     const vim = cm.state.vim;
     const input = vim?.inputState;
+    if (vim && !vim.visualMode) visualObjects.delete(cm);
     if (enabled && key === "s" && vim && !vim.insertMode && !input?.operator && /^\d*$/.test(input?.keyBuffer.join("") ?? "") && isCurrent(cm)) {
-      input.keyBuffer.push(key);
-      return () => true;
+      return prefixes.defer(cm, key, origin);
     }
+    if (enabled && settings.whitespace && ["I", "A"].includes(key) && vim?.visualMode && !vim.visualBlock && !input?.operator && /^\d*$/.test(input?.keyBuffer.join("") ?? "") && isCurrent(cm)) {
+      return prefixes.defer(cm, key, origin);
+    }
+    if (enabled && settings.navigation && vim && !vim.insertMode && !vim.visualBlock && isCurrent(cm) && ["n", "l"].includes(key) && /^\d*[iaIA]$/.test(input?.keyBuffer.join("") ?? "")) {
+      return prefixes.defer(cm, key, origin);
+    }
+    return lookup(cm, key, origin);
+  }
+  function lookup(cm, key, origin) {
+    const vim = cm.state.vim;
+    const input = vim?.inputState;
     const replacing = enabled && vim && !vim.insertMode && isCurrent(cm) && (input?.operator === REGISTER_REPLACE || !input?.operator && key === "r" && /^\d*g$/.test(input?.keyBuffer.join("") ?? "") || key === "." && vim.lastEditInputState?.operator === REGISTER_REPLACE);
-    const saved = replacing ? snapshot(cm) : null;
+    const saved = enabled && vim && !vim.insertMode && isCurrent(cm) ? snapshot(cm) : null;
     const text = replacing ? cm.getValue() : null;
-    const handler = originalFindKey.call(this, cm, key, origin);
+    const handler = originalFindKey.call(V, cm, key, origin);
     if (!saved || typeof handler !== "function") return handler;
     return (...args) => {
-      if (input?.operator !== REGISTER_REPLACE) registerContexts.set(cm, { blocked: !supported(cm), saved, replay: key === "." });
-      const result = handler(...args);
-      if (cm.getValue() === text) {
-        restoreEdit(cm, saved);
-        restoreSelection(cm, saved);
+      const parent = frames.get(cm);
+      const frame = { saved, outcome: null };
+      frames.set(cm, frame);
+      if (replacing && input?.operator !== REGISTER_REPLACE) registerContexts.set(cm, { blocked: !supported(cm), saved, replay: key === "." });
+      try {
+        const result = handler(...args);
+        if (["failed", "pending"].includes(frame.outcome) || replacing && cm.getValue() === text) {
+          restoreEdit(cm, saved);
+          restoreSelection(cm, saved);
+        }
+        if (replacing && cm.state.vim.inputState.operator !== REGISTER_REPLACE) registerContexts.delete(cm);
+        return result;
+      } finally {
+        if (parent && frame.outcome) parent.outcome = frame.outcome;
+        if (parent) frames.set(cm, parent);
+        else frames.delete(cm);
       }
-      if (cm.state.vim.inputState.operator !== REGISTER_REPLACE) registerContexts.delete(cm);
-      return result;
     };
   }
   V.findKey = findKey;
@@ -302,33 +934,85 @@ function installVimExtensions(V, options) {
     options.applyEdit(cm, edit);
     return true;
   }
-  function objectMotion(cm, head, args, vim) {
+  function customObject(cm, args, input) {
+    const frame = frames.get(cm);
+    const s = begin(cm, { input: cloneInput(input), request: { ...args } });
+    s.saved = frame?.saved ?? s.saved;
+    if (frame) frame.outcome = "pending";
+    restoreEdit(cm, s.saved);
+    const ask = (label, accept) => {
+      s.close = options.prompt(cm, { label, single: false, accept(value) {
+        if (!valid(cm, s)) {
+          cancel(cm, false);
+          return;
+        }
+        if (!value || /[\r\n]/.test(value)) {
+          notify("Vim Editing Extensions: boundaries must be non-empty single-line literals.");
+          cancel(cm);
+          return;
+        }
+        accept(value);
+      }, cancel: () => cancel(cm) });
+    };
+    ask("Left boundary", (left) => ask("Right boundary", (right) => {
+      if (!valid(cm, s)) {
+        cancel(cm, false);
+        return;
+      }
+      sessions.delete(cm);
+      s.close?.();
+      restoreEdit(cm, s.saved);
+      restoreSelection(cm, s.saved);
+      resolvedPrompts.set(cm, { ...s.request, markers: [left, right] });
+      cm.state.vim.inputState = cloneInput(s.input);
+      V.handleKey(cm, OBJECT, "vim-editing-extensions");
+    }));
+    return null;
+  }
+  function objectMotion(cm, head, args, vim, input) {
+    const frame = frames.get(cm);
+    if (frame) frame.outcome = "failed";
     if (!supported(cm)) return null;
+    const prepared = resolvedPrompts.get(cm);
+    if (prepared) {
+      resolvedPrompts.delete(cm);
+      Object.assign(args, { ...prepared, repeat: args.repeat });
+    }
+    if (args.id === "?" && !args.markers) return customObject(cm, args, input ?? vim.lastEditInputState ?? vim.inputState);
     const text = cm.getValue();
-    let start = cm.indexFromPos(head), end = start;
-    let exclude = null;
+    let selection;
     if (vim.visualMode) {
       const a = cm.indexFromPos(vim.sel.anchor), h = cm.indexFromPos(vim.sel.head);
-      start = Math.min(a, h);
-      end = Math.max(a, h) + (text.codePointAt(Math.max(a, h)) > 65535 ? 2 : 1);
-      const p2 = findPair(text, start, end, args.target);
-      if (p2 && end - start > 1) {
-        const from2 = args.inner ? p2.innerStart : p2.start;
-        const to2 = args.inner ? p2.innerEnd : p2.end;
-        if (start === from2 && end === to2) exclude = p2;
-      }
+      selection = { from: Math.min(a, h), to: Math.min(text.length, Math.max(a, h) + (text.codePointAt(Math.max(a, h)) > 65535 ? 2 : 1)) };
     }
-    const p = findPair(text, start, end, args.target, args.repeat || 1, exclude);
-    if (!p) return null;
-    const from = args.inner ? p.innerStart : p.start;
-    const to = args.inner ? p.innerEnd : p.end;
+    const previous = visualObjects.get(cm);
+    const token = JSON.stringify([args.id, args.variant, args.direction, args.markers]);
+    const expand = !!(selection && previous?.token === token && previous.text === text && previous.from === selection.from && previous.to === selection.to);
+    const result = resolveObject(text, {
+      id: args.id,
+      variant: args.variant,
+      direction: args.direction,
+      markers: args.markers,
+      head: cm.indexFromPos(head),
+      selection,
+      expand,
+      count: args.repeat || 1,
+      tabSize: cm.getOption?.("tabSize") || 4
+    });
+    if (!result) return null;
+    if (frame) frame.outcome = "matched";
+    const { from, to, linewise } = result;
+    if (selection) visualObjects.set(cm, { ...result, token, text });
+    else visualObjects.delete(cm);
     args.inclusive = false;
-    return [cm.posFromIndex(from), cm.posFromIndex(vim.visualMode && to > from ? previousCharacter(text, to) : to)];
+    args.linewise = linewise;
+    if (vim.visualMode) vim.visualLine = linewise;
+    const end = (vim.visualMode || linewise) && to > from ? previousCharacter(text, to) : to;
+    return [cm.posFromIndex(from), cm.posFromIndex(end)];
   }
   V.defineMotion(NAME + "object", objectMotion);
-  for (const target of ["q", "b"]) for (const [key, inner] of [["i", true], ["a", false]]) {
-    for (const context of ["visual", "operatorPending"]) bind(key + target, "motion", "object", { target, inner }, { context });
-  }
+  for (const { keys, ...request } of mappings) for (const context of ["visual", "operatorPending"]) bind(keys, "motion", "object", request, { context });
+  for (const context of ["visual", "operatorPending"]) bind(OBJECT, "motion", "object", {}, { context });
   function visualRange(cm) {
     const r = cm.listSelections()[0];
     let from = cm.indexFromPos(r.anchor), to = cm.indexFromPos(r.head);
@@ -534,14 +1218,19 @@ function installVimExtensions(V, options) {
   bind("gr", "operator", "registerReplace");
   return {
     cancelAll() {
+      prefixes.cancelAll();
       for (const cm of [...sessions.keys()]) cancel(cm, false);
     },
-    hasPending: (cm) => sessions.has(cm),
+    cancelPrefixes() {
+      prefixes.cancelAll();
+    },
+    hasPending: (cm) => sessions.has(cm) || prefixes.hasPending(cm),
     finishInput(cm, key) {
       const s = sessions.get(cm);
       if (s && !s.close && (["<Esc>", "<C-c>", "<C-[>"].includes(key) || !cm.state.vim.inputState.operator)) cancel(cm);
     },
     uninstall() {
+      prefixes.cancelAll();
       for (const cm of [...sessions.keys()]) cancel(cm);
       enabled = false;
       for (const [key, context] of bindings.reverse()) V.unmap(key, context);
@@ -558,6 +1247,7 @@ async function runSmoke(plugin) {
   const file = await app.vault.create(path, "Vim Editing Extensions compatibility check\n");
   const leaf = app.workspace.getLeaf("tab");
   const results = [];
+  const skippedObjectGroups = [];
   let view;
   let restoreRegisters;
   const pause = () => new Promise((resolve) => setTimeout(resolve, 40));
@@ -597,7 +1287,7 @@ async function runSmoke(plugin) {
         const input = win.document.querySelector("[data-vim-editing-prompt] input");
         if (input) {
           const name = key === "<CR>" ? "Enter" : key === "<Esc>" ? "Escape" : key;
-          if (input.getAttribute("aria-label") === "Tag name and attributes" && key.length === 1) {
+          if (input.getAttribute("aria-label") !== "Surround with character (t: tag)" && key.length === 1) {
             input.value += key;
             input.dispatchEvent(new win.Event("input", { bubbles: true }));
           } else input.dispatchEvent(new win.KeyboardEvent("keydown", { key: name, keyCode: name === "Enter" ? 13 : name === "Escape" ? 27 : key.charCodeAt(0), bubbles: true, cancelable: true }));
@@ -648,6 +1338,33 @@ async function runSmoke(plugin) {
       ['"+griw', "old", 0, "old"],
       ["yiwwgr<Esc>", "NEW old", 0, "NEW old"]
     ];
+    const addObjects = (group, rows) => {
+      if (plugin.settings?.groups[group] !== false && !Object.keys(plugin.settings?.bindings ?? {}).length) fixtures.push(...rows);
+      else skippedObjectGroups.push(group);
+    };
+    addObjects("separators", [
+      ["vi_", "foo_bar", 0, "foo", true],
+      ["va_", "foo_bar", 6, "_bar", true],
+      ["vi_", "one_two_three", 5, "two", true],
+      ["va_", "one_two_three", 5, "two_", true],
+      ["vi<Space>", "one two three", 5, "two", true],
+      ["va<Space>", "one two three", 5, "two ", true],
+      ["vi,", "one,two,three", 5, "two", true],
+      ["v2i_", "one_two_three", 1, "one_two", true],
+      ["vi_i_i_", "one_two_three", 1, "one_two_three", true],
+      ["yiwwgri_", "NEW\nold_value", 0, "NEW\nNEW_value"]
+    ]);
+    addObjects("line", [["viL", "  body  \nnext", 4, "body", true], ["vaL", "  body  \nnext", 4, "  body  ", true]]);
+    addObjects("subword", [["viS", "snake_case", 7, "case", true], ["viS", "XMLParser42", 5, "Parser", true], ["yiwwgriS", "NEW snake_case", 0, "NEW NEW_case"]]);
+    addObjects("brackets", [["viD", "![[Note|Alias]]", 5, "Note|Alias", true], ["vaD", "![[Note|Alias]]", 5, "[[Note|Alias]]", true], ["vio", '["hello"]', 4, '"hello"', true]]);
+    addObjects("arguments", [["via", 'f(first, nested("a,b", [1,2]), last)', 12, 'nested("a,b", [1,2])', true], ["vaa", "f(first, last)", 10, ", last", true], ["vif", "obj.fn(one, two)", 8, "one, two", true], ["vaf", "obj.fn(one, two)", 8, "obj.fn(one, two)", true]]);
+    addObjects("keyValue", [["vik", "\u5907\u6CE8: \u4E0B\u5468\u5904\u7406", 5, "\u5907\u6CE8", true], ["viv", "\u5907\u6CE8: \u4E0B\u5468\u5904\u7406", 0, "\u4E0B\u5468\u5904\u7406", true], ["vav", 'a = "hello",', 6, '"hello",', true], ["div", "10:30", 1, "10:30"]]);
+    addObjects("indentation", [["dii", "parent\n  one\n    child\n  two\nafter", 19, "parent\n  one\n  two\nafter"], ["dai", "```yaml\n  one\n  two\n```\nafter", 12, "```yaml\n```\nafter"], ["dig", "parent\n  body\nafter\n\nnext", 10, "\nnext"], ["dag", "parent\n  body\nafter\n\nnext", 10, "next"]]);
+    addObjects("custom", [["di?BEGIN<CR>END<CR>", "BEGINoldEND", 6, "BEGINEND"], ["vi?**<CR>**<CR>", "**hello**", 4, "hello", true], ["di?BEGIN<CR><Esc>", "BEGINoldEND", 6, "BEGINoldEND"]]);
+    if (plugin.settings?.navigation !== false) fixtures.push(["vinq", '"one"\n"two"', 1, "two", true], ["din)", "before\n(hello)", 0, "before\n()"]);
+    if (plugin.settings?.url) fixtures.push(["vL", "[link](https://example.com/a(b)).", 12, "https://example.com/a(b)", true]);
+    if (plugin.settings?.whitespace) fixtures.push(["vI(", "(  body  ) tail", 5, "body", true], ["vA(", "(  body  ) tail", 5, "(  body  ) ", true]);
+    if (plugin.settings?.buffer) fixtures.push(["dgG", "one\ntwo", 2, ""]);
     for (const live of [false, true]) {
       await view.setState({ ...view.getState(), mode: "source", source: !live }, { history: false });
       for (const [command, text, cursor, expected, selection] of fixtures) {
@@ -678,7 +1395,7 @@ async function runSmoke(plugin) {
       await keys("<C-r>");
       results.push({ mode: live ? "live-preview" : "source", command: "gr redo", passed: editor.getValue() === "NEW NEW NEW", actual: editor.getValue() });
     }
-    return { runtime: app.getVersion?.() ?? win.require("obsidian").apiVersion, testedAt: (/* @__PURE__ */ new Date()).toISOString(), passed: results.filter((r) => r.passed).length, results };
+    return { runtime: app.getVersion?.() ?? win.require("obsidian").apiVersion, testedAt: (/* @__PURE__ */ new Date()).toISOString(), skippedObjectGroups, passed: results.filter((r) => r.passed).length, results };
   } finally {
     restoreRegisters?.();
     await view?.save?.();
@@ -688,12 +1405,102 @@ async function runSmoke(plugin) {
   }
 }
 
+// src/settings-tab.js
+var import_obsidian = require("obsidian");
+var EditingSettingsTab = class extends import_obsidian.PluginSettingTab {
+  constructor(app, plugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+  display() {
+    const { containerEl: el, plugin } = this;
+    el.empty();
+    el.createEl("h2", { text: "Vim Editing Extensions" });
+    el.createEl("p", { text: "Objects work in visual and operator-pending modes. Normal-mode I, A and L are unchanged. Disabling a mapping restores the underlying Vim mapping." });
+    const update = async (next) => {
+      try {
+        await plugin.updateSettings(next);
+      } catch (error) {
+        new import_obsidian.Notice(error.message);
+        this.display();
+      }
+    };
+    let timeoutInput;
+    const timeoutRow = new import_obsidian.Setting(el).setName("Prefix timeout (ms)").setDesc("Wait for s, visual I/A and next/previous object prefixes. 0 waits indefinitely. Timeout or no match uses the original shorter mapping.");
+    timeoutRow.addText((input) => {
+      timeoutInput = input.inputEl;
+      input.setValue(String(plugin.settings.prefixTimeoutMs));
+      Object.assign(timeoutInput, { type: "number", min: "0", max: "60000", step: "1", required: true });
+      timeoutInput.setAttribute("aria-label", "Prefix timeout in milliseconds");
+    });
+    const timeoutStatus = el.createEl("p", { attr: { role: "status", "aria-live": "polite" } });
+    timeoutStatus.id = "vee-prefix-timeout-status";
+    timeoutInput.setAttribute("aria-describedby", timeoutStatus.id);
+    timeoutRow.addButton((button) => button.setButtonText("Apply timeout").onClick(async () => {
+      try {
+        const value = timeoutInput.value.trim();
+        const next = { ...plugin.settings, prefixTimeoutMs: value === "" ? NaN : Number(value) };
+        objectMappings(next);
+        await plugin.updateSettings(next);
+        timeoutInput.removeAttribute("aria-invalid");
+        timeoutStatus.setText("Prefix timeout saved.");
+      } catch (error) {
+        timeoutInput.setAttribute("aria-invalid", "true");
+        timeoutStatus.setText(error.message);
+        timeoutInput.focus();
+      }
+    }));
+    for (const [id, name] of Object.entries(GROUPS)) new import_obsidian.Setting(el).setName(name).addToggle((toggle) => toggle.setValue(plugin.settings.groups[id]).onChange(async (value) => {
+      await update({ ...plugin.settings, groups: { ...plugin.settings.groups, [id]: value } });
+    }));
+    new import_obsidian.Setting(el).setName("Next/previous objects").setDesc("in/an and il/al variants can search across lines.").addToggle((toggle) => toggle.setValue(plugin.settings.navigation).onChange((value) => update({ ...plugin.settings, navigation: value })));
+    for (const [id, name] of Object.entries(OPTIONAL)) new import_obsidian.Setting(el).setName(name).setDesc(id === "whitespace" ? "Visual I/A wait for an object identifier. Esc cancels; block insert remains native." : "Optional mapping; may replace an existing visual or operator-pending motion.").addToggle((toggle) => toggle.setValue(plugin.settings[id]).onChange((value) => update({ ...plugin.settings, [id]: value })));
+    el.createEl("h3", { text: "Object identifiers" });
+    el.createEl("p", { text: "Enter one character, <Space>, or leave empty to disable an object. Changes are applied together with Save bindings. Duplicate and reserved identifiers are rejected." });
+    const draft = normalizeSettings(plugin.settings);
+    for (const object of OBJECTS) new import_obsidian.Setting(el).setName(object.label).addText((input) => {
+      input.setValue(plugin.settings.bindings[object.id] ?? (object.trigger === " " ? "<Space>" : object.trigger));
+      input.inputEl.setAttribute("aria-label", object.label + " identifier");
+      input.inputEl.spellcheck = false;
+      input.inputEl.setAttribute("autocorrect", "off");
+      input.inputEl.setAttribute("autocapitalize", "off");
+      input.onChange((value) => {
+        draft.bindings[object.id] = value;
+      });
+    });
+    const status = el.createEl("p", { attr: { role: "status", "aria-live": "polite", tabindex: "-1" } });
+    new import_obsidian.Setting(el).addButton((button) => button.setButtonText("Save bindings").setCta().onClick(async () => {
+      try {
+        const next = { ...plugin.settings, bindings: draft.bindings };
+        objectMappings(next);
+        await plugin.updateSettings(next);
+        status.setText("Bindings saved.");
+      } catch (error) {
+        status.setText(error.message);
+        status.focus();
+      }
+    })).addButton((button) => button.setButtonText("Reset bindings").onClick(async () => {
+      await plugin.updateSettings({ ...plugin.settings, bindings: {} });
+      this.display();
+    }));
+  }
+};
+
 // src/main.js
-var VimEditingExtensions = class extends import_obsidian.Plugin {
-  onload() {
+var VimEditingExtensions = class extends import_obsidian2.Plugin {
+  async onload() {
     this.controllers = /* @__PURE__ */ new Map();
     this.disposed = false;
     this.reported = false;
+    this.keyEvents = /* @__PURE__ */ new WeakMap();
+    this.settings = normalizeSettings(await this.loadData());
+    try {
+      objectMappings(this.settings);
+    } catch (error) {
+      this.settings = normalizeSettings();
+      new import_obsidian2.Notice(`Vim Editing Extensions: invalid saved settings; using defaults. ${error.message}`);
+    }
+    this.addSettingTab(new EditingSettingsTab(this.app, this));
     this.app.workspace.onLayoutReady(() => this.install());
     this.registerEvent(this.app.workspace.on("active-leaf-change", () => {
       for (const controller of this.controllers.values()) controller.cancelAll();
@@ -709,10 +1516,10 @@ var VimEditingExtensions = class extends import_obsidian.Plugin {
         try {
           const report = await runSmoke(this);
           await this.app.vault.adapter.write(this.manifest.dir + "/validation.json", JSON.stringify(report, null, 2) + "\n");
-          new import_obsidian.Notice(`Vim Editing Extensions: ${report.passed}/${report.results.length} compatibility checks passed.`);
+          new import_obsidian2.Notice(`Vim Editing Extensions: ${report.passed}/${report.results.length} compatibility checks passed.`);
         } catch (error) {
           console.error("[vim-editing-extensions] Compatibility check failed:", error);
-          new import_obsidian.Notice("Vim Editing Extensions: compatibility check failed. See developer console.");
+          new import_obsidian2.Notice("Vim Editing Extensions: compatibility check failed. See developer console.");
         } finally {
           this.testing = false;
         }
@@ -721,6 +1528,24 @@ var VimEditingExtensions = class extends import_obsidian.Plugin {
   }
   getCM(view) {
     return view?.editMode?.editor?.cm?.cm ?? view?.editor?.cm?.cm;
+  }
+  async updateSettings(settings) {
+    const next = normalizeSettings(settings);
+    objectMappings(next);
+    const previous = this.settings;
+    this.settings = next;
+    this.settingsWrite = (this.settingsWrite ?? Promise.resolve()).catch(() => {
+    }).then(() => this.saveData(this.settings));
+    try {
+      await this.settingsWrite;
+    } catch (error) {
+      if (this.settings === next) this.settings = previous;
+      throw error;
+    }
+    if (this.disposed || this.settings !== next) return;
+    for (const controller of this.controllers.values()) controller.uninstall();
+    this.controllers.clear();
+    this.install();
   }
   install() {
     if (this.disposed) return;
@@ -731,23 +1556,42 @@ var VimEditingExtensions = class extends import_obsidian.Plugin {
       if (!V || this.controllers.has(V)) continue;
       try {
         const controller = installVimExtensions(V, {
-          notify: (text) => new import_obsidian.Notice(text),
+          settings: this.settings,
+          notify: (text) => new import_obsidian2.Notice(text),
           isCurrent: (cm) => this.getCM(this.app.workspace.activeLeaf?.view) === cm,
+          getEvent: () => this.keyEvents.get(win),
           prompt: (cm, request) => this.prompt(cm, request),
           applyEdit: (cm, edit) => this.applyEdit(cm, edit)
         });
         this.controllers.set(V, controller);
-        this.registerDomEvent(win.document, "keydown", (event) => {
-          if (event.isComposing || event.keyCode === 229) return;
-          const cm = this.getCM(this.app.workspace.activeLeaf?.view);
-          if (!cm || event.target?.closest?.("[data-vim-editing-prompt]")) return;
-          const key = event.key === "Escape" ? "<Esc>" : event.key;
-          queueMicrotask(() => controller.finishInput(cm, key));
-        });
+        this.keyWindows ??= /* @__PURE__ */ new WeakSet();
+        if (!this.keyWindows.has(win)) {
+          const cancel = () => this.controllers.get(V)?.cancelPrefixes();
+          this.registerDomEvent(win, "keydown", (event) => {
+            if (isForwardedKey(event)) return;
+            if (event.isComposing || event.keyCode === 229) {
+              cancel();
+              return;
+            }
+            this.keyEvents.set(win, event);
+            const cm = this.getCM(this.app.workspace.activeLeaf?.view);
+            win.setTimeout(() => {
+              if (this.keyEvents.get(win) === event) this.keyEvents.delete(win);
+              if (cm && !event.target?.closest?.("[data-vim-editing-prompt]")) {
+                this.controllers.get(V)?.finishInput(cm, event.key === "Escape" ? "<Esc>" : event.key);
+              }
+            }, 0);
+          }, true);
+          this.registerDomEvent(win, "blur", cancel);
+          this.registerDomEvent(win.document, "pointerdown", cancel, true);
+          this.registerDomEvent(win.document, "compositionstart", cancel, true);
+          this.registerDomEvent(win.document, "focusin", cancel, true);
+        }
+        this.keyWindows.add(win);
       } catch (error) {
         console.error("[vim-editing-extensions] Unsupported Vim runtime:", error);
         if (!this.reported) {
-          new import_obsidian.Notice("Vim Editing Extensions: this Vim runtime is not supported; no extension mappings were installed.");
+          new import_obsidian2.Notice("Vim Editing Extensions: this Vim runtime is not supported; no extension mappings were installed.");
           this.reported = true;
         }
       }

@@ -1,10 +1,14 @@
 import { DELIMITERS, TARGETS, findPair, tagPair, editPair, wrapRange, visualPair } from './pairs.js';
 import { registerEdit } from './registers.js';
+import { resolveObject } from './objects.js';
+import { objectMappings, normalizeSettings } from './object-settings.js';
+import { cloneInput, prefixWait } from './prefixes.js';
 
 const NAME = 'vimEditingExtensions';
 const ADD = '<VEEAdd>';
 const COMMIT = '<VEECommit>';
 const REGISTER_REPLACE = NAME + 'registerReplace';
+const OBJECT = '<VEEObject>';
 
 const copyPos = p => ({ line: p.line, ch: p.ch });
 function previousCharacter(text, end) {
@@ -23,6 +27,11 @@ export function installVimExtensions(V, options) {
   const sessions = new Map();
   const staged = new WeakMap();
   const registerContexts = new WeakMap();
+  const frames = new WeakMap();
+  const visualObjects = new WeakMap();
+  const resolvedPrompts = new WeakMap();
+  const settings = normalizeSettings(options.settings);
+  const mappings = objectMappings(settings);
   const notify = options.notify ?? (() => {});
   const isCurrent = options.isCurrent ?? (() => true);
 
@@ -30,14 +39,33 @@ export function installVimExtensions(V, options) {
   // every multi-key `sa/sd/sr` prefix. Defer its dispatch while enabled without
   // deleting the original keymap (including any user's custom single-s map).
   const originalFindKey = V.findKey;
+  const prefixes = prefixWait({ lookup, timeoutMs: settings.prefixTimeoutMs, isCurrent, getEvent: options.getEvent });
   function findKey(cm, key, origin) {
+    if (prefixes.forwarding) return;
+    const pending = prefixes.resolve(cm, key, origin);
+    if (pending) return pending.handler;
     const vim = cm.state.vim;
     const input = vim?.inputState;
+    if (vim && !vim.visualMode) visualObjects.delete(cm);
     if (enabled && key === 's' && vim && !vim.insertMode && !input?.operator &&
         /^\d*$/.test(input?.keyBuffer.join('') ?? '') && isCurrent(cm)) {
-      input.keyBuffer.push(key);
-      return () => true;
+      return prefixes.defer(cm, key, origin);
     }
+    if (enabled && settings.whitespace && ['I', 'A'].includes(key) && vim?.visualMode && !vim.visualBlock &&
+        !input?.operator && /^\d*$/.test(input?.keyBuffer.join('') ?? '') && isCurrent(cm)) {
+      return prefixes.defer(cm, key, origin);
+    }
+    // Native i<register>/a<register> are complete after two keys. Hold n/l
+    // only where our three-key next/previous object mappings need a third key.
+    if (enabled && settings.navigation && vim && !vim.insertMode && !vim.visualBlock && isCurrent(cm) &&
+        ['n', 'l'].includes(key) && /^\d*[iaIA]$/.test(input?.keyBuffer.join('') ?? '')) {
+      return prefixes.defer(cm, key, origin);
+    }
+    return lookup(cm, key, origin);
+  }
+  function lookup(cm, key, origin) {
+    const vim = cm.state.vim;
+    const input = vim?.inputState;
     // evalInput records an edit before it knows whether a motion/register can
     // produce an edit. Guard only our operator (including dot replay), so a
     // failed replacement cannot destroy the previous repeat or visual selection.
@@ -45,19 +73,27 @@ export function installVimExtensions(V, options) {
       input?.operator === REGISTER_REPLACE ||
       (!input?.operator && key === 'r' && /^\d*g$/.test(input?.keyBuffer.join('') ?? '')) ||
       (key === '.' && vim.lastEditInputState?.operator === REGISTER_REPLACE));
-    const saved = replacing ? snapshot(cm) : null;
+    const saved = enabled && vim && !vim.insertMode && isCurrent(cm) ? snapshot(cm) : null;
     const text = replacing ? cm.getValue() : null;
-    const handler = originalFindKey.call(this, cm, key, origin);
+    const handler = originalFindKey.call(V, cm, key, origin);
     if (!saved || typeof handler !== 'function') return handler;
     return (...args) => {
-      if (input?.operator !== REGISTER_REPLACE) registerContexts.set(cm, { blocked: !supported(cm), saved, replay: key === '.' });
-      const result = handler(...args);
-      if (cm.getValue() === text) {
-        restoreEdit(cm, saved);
-        restoreSelection(cm, saved);
+      const parent = frames.get(cm);
+      const frame = { saved, outcome: null };
+      frames.set(cm, frame);
+      if (replacing && input?.operator !== REGISTER_REPLACE) registerContexts.set(cm, { blocked: !supported(cm), saved, replay: key === '.' });
+      try {
+        const result = handler(...args);
+        if (['failed', 'pending'].includes(frame.outcome) || (replacing && cm.getValue() === text)) {
+          restoreEdit(cm, saved);
+          restoreSelection(cm, saved);
+        }
+        if (replacing && cm.state.vim.inputState.operator !== REGISTER_REPLACE) registerContexts.delete(cm);
+        return result;
+      } finally {
+        if (parent && frame.outcome) parent.outcome = frame.outcome;
+        if (parent) frames.set(cm, parent); else frames.delete(cm);
       }
-      if (cm.state.vim.inputState.operator !== REGISTER_REPLACE) registerContexts.delete(cm);
-      return result;
     };
   }
   V.findKey = findKey;
@@ -134,33 +170,64 @@ export function installVimExtensions(V, options) {
     return true;
   }
 
-  function objectMotion(cm, head, args, vim) {
+  function customObject(cm, args, input) {
+    const frame = frames.get(cm);
+    const s = begin(cm, { input: cloneInput(input), request: { ...args } });
+    s.saved = frame?.saved ?? s.saved;
+    if (frame) frame.outcome = 'pending';
+    restoreEdit(cm, s.saved);
+    const ask = (label, accept) => {
+      s.close = options.prompt(cm, { label, single: false, accept(value) {
+        if (!valid(cm, s)) { cancel(cm, false); return; }
+        if (!value || /[\r\n]/.test(value)) { notify('Vim Editing Extensions: boundaries must be non-empty single-line literals.'); cancel(cm); return; }
+        accept(value);
+      }, cancel: () => cancel(cm) });
+    };
+    ask('Left boundary', left => ask('Right boundary', right => {
+      if (!valid(cm, s)) { cancel(cm, false); return; }
+      sessions.delete(cm); s.close?.();
+      restoreEdit(cm, s.saved);
+      restoreSelection(cm, s.saved);
+      resolvedPrompts.set(cm, { ...s.request, markers: [left, right] });
+      cm.state.vim.inputState = cloneInput(s.input);
+      V.handleKey(cm, OBJECT, 'vim-editing-extensions');
+    }));
+    return null;
+  }
+  function objectMotion(cm, head, args, vim, input) {
+    const frame = frames.get(cm);
+    if (frame) frame.outcome = 'failed';
     if (!supported(cm)) return null;
+    const prepared = resolvedPrompts.get(cm);
+    if (prepared) {
+      resolvedPrompts.delete(cm);
+      Object.assign(args, { ...prepared, repeat: args.repeat });
+    }
+    if (args.id === '?' && !args.markers) return customObject(cm, args, input ?? vim.lastEditInputState ?? vim.inputState);
     const text = cm.getValue();
-    let start = cm.indexFromPos(head), end = start;
-    let exclude = null;
+    let selection;
     if (vim.visualMode) {
       const a = cm.indexFromPos(vim.sel.anchor), h = cm.indexFromPos(vim.sel.head);
-      start = Math.min(a, h);
-      end = Math.max(a, h) + (text.codePointAt(Math.max(a, h)) > 0xFFFF ? 2 : 1);
-      const p = findPair(text, start, end, args.target);
-      if (p && end - start > 1) {
-        const from = args.inner ? p.innerStart : p.start;
-        const to = args.inner ? p.innerEnd : p.end;
-        if (start === from && end === to) exclude = p;
-      }
+      selection = { from: Math.min(a, h), to: Math.min(text.length, Math.max(a, h) + (text.codePointAt(Math.max(a, h)) > 0xFFFF ? 2 : 1)) };
     }
-    const p = findPair(text, start, end, args.target, args.repeat || 1, exclude);
-    if (!p) return null;
-    const from = args.inner ? p.innerStart : p.start;
-    const to = args.inner ? p.innerEnd : p.end;
+    const previous = visualObjects.get(cm);
+    const token = JSON.stringify([args.id, args.variant, args.direction, args.markers]);
+    const expand = !!(selection && previous?.token === token && previous.text === text && previous.from === selection.from && previous.to === selection.to);
+    const result = resolveObject(text, { id: args.id, variant: args.variant, direction: args.direction, markers: args.markers,
+      head: cm.indexFromPos(head), selection, expand, count: args.repeat || 1, tabSize: cm.getOption?.('tabSize') || 4 });
+    if (!result) return null;
+    if (frame) frame.outcome = 'matched';
+    const { from, to, linewise } = result;
+    if (selection) visualObjects.set(cm, { ...result, token, text }); else visualObjects.delete(cm);
     args.inclusive = false;
-    return [cm.posFromIndex(from), cm.posFromIndex(vim.visualMode && to > from ? previousCharacter(text, to) : to)];
+    args.linewise = linewise;
+    if (vim.visualMode) vim.visualLine = linewise;
+    const end = (vim.visualMode || linewise) && to > from ? previousCharacter(text, to) : to;
+    return [cm.posFromIndex(from), cm.posFromIndex(end)];
   }
   V.defineMotion(NAME + 'object', objectMotion);
-  for (const target of ['q', 'b']) for (const [key, inner] of [['i', true], ['a', false]]) {
-    for (const context of ['visual', 'operatorPending']) bind(key + target, 'motion', 'object', { target, inner }, { context });
-  }
+  for (const { keys, ...request } of mappings) for (const context of ['visual', 'operatorPending']) bind(keys, 'motion', 'object', request, { context });
+  for (const context of ['visual', 'operatorPending']) bind(OBJECT, 'motion', 'object', {}, { context });
 
   function visualRange(cm) {
     const r = cm.listSelections()[0];
@@ -352,14 +419,16 @@ export function installVimExtensions(V, options) {
   bind('gr', 'operator', 'registerReplace');
 
   return {
-    cancelAll() { for (const cm of [...sessions.keys()]) cancel(cm, false); },
-    hasPending: cm => sessions.has(cm),
+    cancelAll() { prefixes.cancelAll(); for (const cm of [...sessions.keys()]) cancel(cm, false); },
+    cancelPrefixes() { prefixes.cancelAll(); },
+    hasPending: cm => sessions.has(cm) || prefixes.hasPending(cm),
     finishInput(cm, key) {
       // Called after a physical key, not during the engine's internal clearInputState.
       const s = sessions.get(cm);
       if (s && !s.close && (['<Esc>', '<C-c>', '<C-[>'].includes(key) || !cm.state.vim.inputState.operator)) cancel(cm);
     },
     uninstall() {
+      prefixes.cancelAll();
       for (const cm of [...sessions.keys()]) cancel(cm);
       enabled = false;
       for (const [key, context] of bindings.reverse()) V.unmap(key, context);

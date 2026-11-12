@@ -46,7 +46,7 @@ function editor(text, cursor = 0) {
   cm.setCursor(cm.posFromIndex(cursor));
   return cm;
 }
-function keys(cm, sequence) {
+function keys(cm, sequence, origin = 'test') {
   const tokens = sequence.match(/<[^>]+>|[\s\S]/g) ?? [];
   let tag = '';
   for (const key of tokens) {
@@ -57,7 +57,7 @@ function keys(cm, sequence) {
       else if (key === '<CR>') { prompts.delete(cm); request.accept(tag); tag = ''; }
       else tag += key;
     } else {
-      const handled = V.handleKey(cm, key, 'test');
+      const handled = V.handleKey(cm, key, origin);
       if (!handled && cm.state.vim.insertMode && key.length === 1) {
         cm.operation(() => cm.replaceSelection(key, 'end', '+input'));
       }
@@ -353,6 +353,293 @@ test('gr disable/re-enable restores pre-existing mappings', () => {
   V.unmap('gr', 'normal');
   controller = installVimExtensions(V, installOptions);
   setRegister('"', 'OK'); keys(cm, 'griw'); assert.equal(cm.getValue(), 'OK tail');
+});
+
+test('new objects select explicit separators, arguments, calls, subwords, line text and links', () => {
+  for (const [text, cursor, command, expected] of [
+    ['one_two_three', 5, 'vi_', 'two'], ['one_two_three', 5, 'va_', 'two_'],
+    ['foo_bar', 0, 'vi_', 'foo'], ['foo_bar', 6, 'va_', '_bar'],
+    ['foo bar baz', 5, 'vi<Space>', 'bar'], ['foo bar baz', 5, 'va<Space>', 'bar '],
+    ['one,two,three', 5, 'vi,', 'two'], ['f(first, nested("a,b", [1,2]), last)', 12, 'via', 'nested("a,b", [1,2])'],
+    ['f(first, last)', 10, 'vaa', ', last'], ['obj.fn(one, two)', 8, 'vif', 'one, two'],
+    ['obj.fn(one, two)', 8, 'vaf', 'obj.fn(one, two)'],
+    ['snake_case', 7, 'viS', 'case'], ['XMLParser42', 5, 'viS', 'Parser'],
+    ['  body  \nnext', 4, 'viL', 'body'], ['  body  \nnext', 4, 'vaL', '  body  '],
+    ['![[Note|Alias]]', 5, 'viD', 'Note|Alias'], ['![[Note|Alias]]', 5, 'vaD', '[[Note|Alias]]'],
+    ['["hello"]', 4, 'vio', '"hello"'], ['备注: 下周处理', 5, 'vik', '备注'],
+    ['备注: 下周处理', 0, 'viv', '下周处理'], ['a = "hello",', 6, 'vav', '"hello",'],
+  ]) {
+    const cm = editor(text, cursor); keys(cm, command);
+    assert.equal(cm.getSelection(), expected, command + ' in ' + text);
+  }
+});
+
+test('new motions combine with native delete/change/yank, gr, counts, undo and repeat', () => {
+  const cm = editor('one_two_three');
+  keys(cm, 'di_'); assert.equal(cm.getValue(), '_two_three');
+  keys(cm, 'u'); assert.equal(cm.getValue(), 'one_two_three');
+  cm.setCursor(cm.posFromIndex(5)); keys(cm, 'ci_NEW<Esc>'); assert.equal(cm.getValue(), 'one_NEW_three');
+  cm.setCursor(cm.posFromIndex(9)); keys(cm, '.'); assert.equal(cm.getValue(), 'one_NEW_NEW');
+  const yank = editor('foo_bar');
+  keys(yank, 'yi_'); assert.equal(V.getRegisterController().getRegister('"').toString(), 'foo');
+  yank.setCursor(yank.posFromIndex(5)); keys(yank, 'gri_'); assert.equal(yank.getValue(), 'foo_foo');
+  const counted = editor('one_two_three');
+  setRegister('a', 'X'); keys(counted, '"agr2i_'); assert.equal(counted.getValue(), 'X_three');
+  keys(counted, 'u'); keys(counted, 'v2i_'); assert.equal(counted.getSelection(), 'one_two');
+});
+
+test('object navigation crosses lines explicitly and repeated selection grows without wrapping', () => {
+  const cm = editor('"one"\n"two"\n"three"', 1);
+  keys(cm, 'vinq'); assert.equal(cm.getSelection(), 'two');
+  keys(cm, '<Esc>'); cm.setCursor(cm.posFromIndex(1));
+  keys(cm, 'v2inq'); assert.equal(cm.getSelection(), 'three');
+  keys(cm, '<Esc>'); cm.setCursor(cm.posFromIndex(15));
+  keys(cm, 'vilq'); assert.equal(cm.getSelection(), 'two');
+  const flat = editor('one_two_three', 1);
+  keys(flat, 'vi_i_'); assert.equal(flat.getSelection(), 'one_two');
+  keys(flat, 'i_'); assert.equal(flat.getSelection(), 'one_two_three');
+  keys(flat, 'i_'); assert.equal(flat.getSelection(), 'one_two_three');
+  const distant = editor('before\n(hello)', 0);
+  keys(distant, 'din)'); assert.equal(distant.getValue(), 'before\n()');
+});
+
+test('indentation motions produce exact linewise edits without consuming code fences', () => {
+  const text = 'parent\n  one\n    child\n  two\nafter';
+  const cm = editor(text, text.indexOf('child'));
+  keys(cm, 'dii'); assert.equal(cm.getValue(), 'parent\n  one\n  two\nafter');
+  keys(cm, 'u'); assert.equal(cm.getValue(), text);
+  const gr = editor(text, text.indexOf('one'));
+  setRegister('a', '  NEW'); keys(gr, '"agrii');
+  assert.equal(gr.getValue(), 'parent\n  NEW\nafter');
+  const fenced = editor('```yaml\n  one\n  two\n```\nafter', 12);
+  keys(fenced, 'dai'); assert.equal(fenced.getValue(), '```yaml\n```\nafter');
+  const visual = editor(text, text.indexOf('child'));
+  keys(visual, 'vii'); assert.equal(visual.getSelection().replace(/\n$/, ''), '    child');
+  assert.equal(visual.state.vim.visualLine, true);
+});
+
+test('missing new objects preserve native repeat and register state for all operators', () => {
+  const cm = editor('one two');
+  keys(cm, 'ciwNEW<Esc>'); cm.setCursor(cm.posFromIndex(4));
+  const saved = cm.state.vim.lastEditInputState;
+  setRegister('a', 'copied');
+  for (const command of ['di_', 'ci_', '"ayi_', 'gria', 'diD', 'div']) {
+    keys(cm, command);
+    assert.equal(cm.getValue(), 'NEW two', command);
+    assert.equal(cm.state.vim.lastEditInputState, saved, command);
+    assert.equal(cm.state.vim.insertMode, false, command);
+    assert.equal(V.getRegisterController().getRegister('a').toString(), 'copied');
+  }
+  keys(cm, '.'); assert.equal(cm.getValue(), 'NEW NEW');
+});
+
+test('custom boundaries preserve the operator, count, source register and repeat without prompting again', () => {
+  const cm = editor('BEGINoneEND BEGINtwoEND', 6);
+  keys(cm, 'di?BEGIN<CR>END<CR>'); assert.equal(cm.getValue(), 'BEGINEND BEGINtwoEND');
+  cm.setCursor(cm.posFromIndex(16)); keys(cm, '.');
+  assert.equal(cm.getValue(), 'BEGINEND BEGINEND'); assert.equal(prompts.has(cm), false);
+  const visual = editor('**hello**', 4);
+  keys(visual, 'vi?**<CR>**<CR>'); assert.equal(visual.getSelection(), 'hello');
+  const gr = editor('BEGINoldEND', 6);
+  setRegister('a', 'NEW'); keys(gr, '"agri?BEGIN<CR>END<CR>'); assert.equal(gr.getValue(), 'BEGINNEWEND');
+  assert.equal(V.getRegisterController().getRegister('a').toString(), 'NEW');
+  const change = editor('BEGINoldEND', 6);
+  keys(change, 'ci?BEGIN<CR>END<CR>NEW<Esc>'); assert.equal(change.getValue(), 'BEGINNEWEND');
+});
+
+test('custom boundary cancellation and stale documents cannot edit or destroy previous repeat', () => {
+  const cm = editor('one two'); keys(cm, 'ciwNEW<Esc>');
+  cm.setCursor(cm.posFromIndex(4)); const previous = cm.state.vim.lastEditInputState;
+  for (const command of ['di?<Esc>', 'di?BEGIN<CR><Esc>', 'di?<CR>']) {
+    keys(cm, command); assert.equal(cm.getValue(), 'NEW two');
+    assert.equal(cm.state.vim.lastEditInputState, previous);
+  }
+  keys(cm, 'di?BEGIN<CR>'); const request = prompts.get(cm);
+  cm.setValue('changed externally'); prompts.delete(cm); request.accept('END');
+  assert.equal(cm.getValue(), 'changed externally'); assert.equal(controller.hasPending(cm), false);
+});
+
+test('optional URL, whitespace and whole-document objects are reversible and keep normal I/A/L native', () => {
+  controller.uninstall();
+  controller = installVimExtensions(V, { ...installOptions, settings: { url: true, whitespace: true, buffer: true } });
+  try {
+    const url = editor('[link](https://example.com/a(b)).', 12);
+    keys(url, 'yL'); assert.equal(V.getRegisterController().getRegister('"').toString(), 'https://example.com/a(b)');
+    const spaces = editor('(  body  ) tail', 5);
+    keys(spaces, 'vI('); assert.equal(spaces.getSelection(), 'body');
+    keys(spaces, '<Esc>'); spaces.setCursor(spaces.posFromIndex(5));
+    keys(spaces, 'vA('); assert.equal(spaces.getSelection(), '(  body  ) ');
+    const all = editor('one\ntwo', 2); keys(all, 'ygG');
+    assert.equal(V.getRegisterController().getRegister('"').toString(), 'one\ntwo\n');
+    const normal = editor('word'); keys(normal, 'IPRE<Esc>AEND<Esc>'); assert.equal(normal.getValue(), 'PREwordEND');
+    const block = editor('one\ntwo'); keys(block, '<C-v>jI');
+    assert.equal(block.state.vim.insertMode, true, 'native block insertion must not wait for an object identifier');
+    keys(block, '<Esc>'); assert.equal(block.getValue(), 'one\ntwo');
+    controller.uninstall();
+    controller = installVimExtensions(V, installOptions);
+    const original = editor('body'); keys(original, 'vInew<Esc>'); assert.ok(original.getValue().includes('new'));
+  } finally {
+    controller.uninstall(); controller = installVimExtensions(V, installOptions);
+  }
+});
+
+test('customized identifiers replace only owned mappings and disabled groups stay native', () => {
+  controller.uninstall();
+  controller = installVimExtensions(V, { ...installOptions, settings: { bindings: { L: 'Z' }, groups: { separators: false } } });
+  const cm = editor('  one_two  ', 5);
+  keys(cm, 'viZ'); assert.equal(cm.getSelection(), 'one_two');
+  keys(cm, '<Esc>vi_'); assert.notEqual(cm.getSelection(), 'one');
+  controller.uninstall(); controller = installVimExtensions(V, installOptions);
+});
+
+function timed(t, run, extra = {}) {
+  controller.uninstall();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 1000 });
+  controller = installVimExtensions(V, { ...installOptions, settings: { prefixTimeoutMs: 100 }, ...extra });
+  try { run(); } finally {
+    controller.uninstall();
+    t.mock.timers.reset();
+    controller = installVimExtensions(V, installOptions);
+  }
+}
+
+test('100 ms prefix deadline restores native substitution, count and named register once', t => timed(t, () => {
+  const cm = editor('hello');
+  keys(cm, '"z2s');
+  t.mock.timers.tick(99);
+  assert.equal(cm.getValue(), 'hello');
+  t.mock.timers.tick(1);
+  assert.equal(cm.getValue(), 'llo');
+  assert.equal(cm.state.vim.insertMode, true);
+  assert.equal(V.getRegisterController().getRegister('z').toString(), 'he');
+  t.mock.timers.tick(500);
+  assert.equal(cm.getValue(), 'llo');
+  keys(cm, 'X<Esc>');
+  assert.equal(cm.getValue(), 'Xllo');
+}));
+
+test('timely sd/sa commit their prefix without timing out the remaining motion or target', t => timed(t, () => {
+  const cm = editor('"hello"', 2);
+  keys(cm, 's'); t.mock.timers.tick(99); keys(cm, 'd');
+  t.mock.timers.tick(500); keys(cm, '"');
+  assert.equal(cm.getValue(), 'hello');
+  keys(cm, 's'); t.mock.timers.tick(99); keys(cm, 'a');
+  t.mock.timers.tick(500); keys(cm, 'iw)');
+  assert.equal(cm.getValue(), '(hello)');
+}));
+
+test('unmatched second key follows native s into insert mode without loss or duplication', t => timed(t, () => {
+  const cm = editor('hello');
+  keys(cm, 'sz<Esc>');
+  assert.equal(cm.getValue(), 'zello');
+  t.mock.timers.tick(500);
+  assert.equal(cm.getValue(), 'zello');
+}));
+
+test('a delayed timer cannot accept a combination after its deadline', t => timed(t, () => {
+  const cm = editor('hello');
+  keys(cm, 's');
+  // Move wall time without running the queued timer, as when the UI is busy.
+  t.mock.timers.setTime(1100);
+  keys(cm, 'd<Esc>');
+  assert.equal(cm.getValue(), 'dello');
+  t.mock.timers.tick(500);
+  assert.equal(cm.getValue(), 'dello');
+}));
+
+test('fallback consults current custom mappings and keeps foreign s-prefixed mappings', t => timed(t, () => {
+  V.map('s', 'x', 'normal');
+  V.map('sZ', 'l', 'normal');
+  try {
+    const cm = editor('hello');
+    keys(cm, 'sZ'); assert.equal(cm.getCursor().ch, 1); assert.equal(cm.getValue(), 'hello');
+    keys(cm, 's'); t.mock.timers.tick(100); assert.equal(cm.getValue(), 'hllo');
+    V.map('s', 'l', 'normal');
+    keys(cm, 'sz'); assert.equal(cm.getValue(), 'hllo'); assert.equal(cm.getCursor().ch, 2);
+  } finally { V.unmap('sZ', 'normal'); V.unmap('s', 'normal'); }
+}));
+
+test('Esc, stale document, moved cursor, inactive editor and uninstall cancel delayed actions', t => {
+  let current = true;
+  timed(t, () => {
+    for (const change of [
+      cm => keys(cm, '<Esc>'),
+      cm => cm.setValue('changed'),
+      cm => cm.setCursor({ line: 0, ch: 2 }),
+      () => { current = false; },
+      () => controller.cancelPrefixes(),
+      () => controller.uninstall(),
+    ]) {
+      current = true;
+      const cm = editor('hello'); keys(cm, 's'); change(cm);
+      const text = cm.getValue();
+      t.mock.timers.tick(100);
+      assert.equal(cm.getValue(), text);
+      assert.equal(cm.state.vim.insertMode, false);
+      assert.equal(controller.hasPending(cm), false);
+    }
+  }, { isCurrent: () => current });
+});
+
+test('visual whitespace and navigation prefixes share timeout but native g/gr do not', t => timed(t, () => {
+  const cm = editor('( one ) "two"', 2);
+  keys(cm, 'vI'); t.mock.timers.tick(99); keys(cm, '(');
+  assert.equal(cm.getSelection(), 'one');
+  keys(cm, '<Esc>vin'); t.mock.timers.tick(99); keys(cm, '"');
+  assert.equal(cm.getSelection(), 'two');
+  keys(cm, '<Esc>');
+  cm.setCursor({ line: 0, ch: 2 });
+  setRegister('z', 'NEW'); keys(cm, '"zg'); t.mock.timers.tick(500); keys(cm, 'riw');
+  assert.equal(cm.getValue(), '( NEW ) "two"');
+}, { settings: { prefixTimeoutMs: 100, whitespace: true } }));
+
+test('zero keeps indefinite waiting and invalid timeout settings are rejected', t => timed(t, () => {
+  const cm = editor('"hello"', 2);
+  keys(cm, 's'); t.mock.timers.tick(60001); keys(cm, 'd"');
+  assert.equal(cm.getValue(), 'hello');
+  for (const prefixTimeoutMs of [-1, 0.5, '100', null, NaN, 60001]) {
+    assert.throws(() => installVimExtensions(V, { ...installOptions, settings: { prefixTimeoutMs } }), /Prefix timeout/);
+  }
+}, { settings: { prefixTimeoutMs: 0 } }));
+
+test('unmatched physical key reaches a newly opened host listener exactly once', t => {
+  let event;
+  timed(t, () => {
+    const cm = editor('hello');
+    const input = document.createElement('input'); document.body.append(input); input.focus();
+    let opened = 0, received = '';
+    const listener = e => { received += e.key; e.preventDefault(); e.stopImmediatePropagation(); };
+    V.defineAction('veeTestHost', () => { opened++; window.addEventListener('keydown', listener, true); });
+    V.mapCommand('s', 'action', 'veeTestHost', {}, { context: 'normal' });
+    try {
+      event = new window.KeyboardEvent('keydown', { key: 's', bubbles: true, cancelable: true });
+      input.dispatchEvent(event); keys(cm, 's', 'user');
+      event = new window.KeyboardEvent('keydown', { key: 'z', bubbles: true, cancelable: true });
+      input.dispatchEvent(event); keys(cm, 'z', 'user');
+      assert.equal(opened, 1); assert.equal(received, 'z');
+      assert.equal(cm.getValue(), 'hello');
+      t.mock.timers.tick(500); assert.equal(opened, 1);
+    } finally { window.removeEventListener('keydown', listener, true); V.unmap('s', 'normal'); input.remove(); }
+  }, { getEvent: () => event });
+});
+
+test('an internal Vim mapping never forwards its unrelated physical trigger to the host', t => {
+  let event;
+  timed(t, () => {
+    const cm = editor('hello');
+    const input = document.createElement('input'); document.body.append(input); input.focus();
+    let received = '';
+    const listener = e => { received += e.key; e.preventDefault(); };
+    V.defineAction('veeTestMappedHost', () => window.addEventListener('keydown', listener, true));
+    V.mapCommand('s', 'action', 'veeTestMappedHost', {}, { context: 'normal' });
+    V.map('Q', 'sz', 'normal');
+    try {
+      event = new window.KeyboardEvent('keydown', { key: 'Q', bubbles: true, cancelable: true });
+      input.dispatchEvent(event); keys(cm, 'Q', 'user');
+      assert.equal(received, '');
+      assert.equal(cm.getValue(), 'hello');
+    } finally { window.removeEventListener('keydown', listener, true); V.unmap('Q', 'normal'); V.unmap('s', 'normal'); input.remove(); }
+  }, { getEvent: () => event });
 });
 
 after(() => { controller.uninstall(); views.forEach(v => v.destroy()); dom.window.close(); });

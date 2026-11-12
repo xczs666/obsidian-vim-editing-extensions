@@ -6,6 +6,7 @@ export async function runSmoke(plugin) {
   const file = await app.vault.create(path, 'Vim Editing Extensions compatibility check\n');
   const leaf = app.workspace.getLeaf('tab');
   const results = [];
+  const skippedObjectGroups = [];
   let view;
   let restoreRegisters;
   const pause = () => new Promise(resolve => setTimeout(resolve, 40));
@@ -45,7 +46,7 @@ export async function runSmoke(plugin) {
         const input = win.document.querySelector('[data-vim-editing-prompt] input');
         if (input) {
           const name = key === '<CR>' ? 'Enter' : key === '<Esc>' ? 'Escape' : key;
-          if (input.getAttribute('aria-label') === 'Tag name and attributes' && key.length === 1) {
+          if (input.getAttribute('aria-label') !== 'Surround with character (t: tag)' && key.length === 1) {
             input.value += key;
             input.dispatchEvent(new win.Event('input', { bubbles: true }));
           } else input.dispatchEvent(new win.KeyboardEvent('keydown', { key: name, keyCode: name === 'Enter' ? 13 : name === 'Escape' ? 27 : key.charCodeAt(0), bubbles: true, cancelable: true }));
@@ -87,6 +88,31 @@ export async function runSmoke(plugin) {
       ['"+griw', 'old', 0, 'old'],
       ['yiwwgr<Esc>', 'NEW old', 0, 'NEW old'],
     ];
+    // New fixtures are skipped for explicitly disabled groups or custom IDs;
+    // remapped identifiers are covered by runtime tests rather than guessed here.
+    const addObjects = (group, rows) => {
+      if (plugin.settings?.groups[group] !== false && !Object.keys(plugin.settings?.bindings ?? {}).length) fixtures.push(...rows);
+      else skippedObjectGroups.push(group);
+    };
+    addObjects('separators', [
+      ['vi_', 'foo_bar', 0, 'foo', true], ['va_', 'foo_bar', 6, '_bar', true],
+      ['vi_', 'one_two_three', 5, 'two', true], ['va_', 'one_two_three', 5, 'two_', true],
+      ['vi<Space>', 'one two three', 5, 'two', true], ['va<Space>', 'one two three', 5, 'two ', true],
+      ['vi,', 'one,two,three', 5, 'two', true], ['v2i_', 'one_two_three', 1, 'one_two', true],
+      ['vi_i_i_', 'one_two_three', 1, 'one_two_three', true],
+      ['yiwwgri_', 'NEW\nold_value', 0, 'NEW\nNEW_value'],
+    ]);
+    addObjects('line', [['viL', '  body  \nnext', 4, 'body', true], ['vaL', '  body  \nnext', 4, '  body  ', true]]);
+    addObjects('subword', [['viS', 'snake_case', 7, 'case', true], ['viS', 'XMLParser42', 5, 'Parser', true], ['yiwwgriS', 'NEW snake_case', 0, 'NEW NEW_case']]);
+    addObjects('brackets', [['viD', '![[Note|Alias]]', 5, 'Note|Alias', true], ['vaD', '![[Note|Alias]]', 5, '[[Note|Alias]]', true], ['vio', '["hello"]', 4, '"hello"', true]]);
+    addObjects('arguments', [['via', 'f(first, nested("a,b", [1,2]), last)', 12, 'nested("a,b", [1,2])', true], ['vaa', 'f(first, last)', 10, ', last', true], ['vif', 'obj.fn(one, two)', 8, 'one, two', true], ['vaf', 'obj.fn(one, two)', 8, 'obj.fn(one, two)', true]]);
+    addObjects('keyValue', [['vik', '备注: 下周处理', 5, '备注', true], ['viv', '备注: 下周处理', 0, '下周处理', true], ['vav', 'a = "hello",', 6, '"hello",', true], ['div', '10:30', 1, '10:30']]);
+    addObjects('indentation', [['dii', 'parent\n  one\n    child\n  two\nafter', 19, 'parent\n  one\n  two\nafter'], ['dai', '```yaml\n  one\n  two\n```\nafter', 12, '```yaml\n```\nafter'], ['dig', 'parent\n  body\nafter\n\nnext', 10, '\nnext'], ['dag', 'parent\n  body\nafter\n\nnext', 10, 'next']]);
+    addObjects('custom', [['di?BEGIN<CR>END<CR>', 'BEGINoldEND', 6, 'BEGINEND'], ['vi?**<CR>**<CR>', '**hello**', 4, 'hello', true], ['di?BEGIN<CR><Esc>', 'BEGINoldEND', 6, 'BEGINoldEND']]);
+    if (plugin.settings?.navigation !== false) fixtures.push(['vinq', '"one"\n"two"', 1, 'two', true], ['din)', 'before\n(hello)', 0, 'before\n()']);
+    if (plugin.settings?.url) fixtures.push(['vL', '[link](https://example.com/a(b)).', 12, 'https://example.com/a(b)', true]);
+    if (plugin.settings?.whitespace) fixtures.push(['vI(', '(  body  ) tail', 5, 'body', true], ['vA(', '(  body  ) tail', 5, '(  body  ) ', true]);
+    if (plugin.settings?.buffer) fixtures.push(['dgG', 'one\ntwo', 2, '']);
     for (const live of [false, true]) {
       await view.setState({ ...view.getState(), mode: 'source', source: !live }, { history: false });
       for (const [command, text, cursor, expected, selection] of fixtures) {
@@ -111,7 +137,7 @@ export async function runSmoke(plugin) {
       await keys('<C-r>');
       results.push({ mode: live ? 'live-preview' : 'source', command: 'gr redo', passed: editor.getValue() === 'NEW NEW NEW', actual: editor.getValue() });
     }
-    return { runtime: app.getVersion?.() ?? win.require('obsidian').apiVersion, testedAt: new Date().toISOString(), passed: results.filter(r => r.passed).length, results };
+    return { runtime: app.getVersion?.() ?? win.require('obsidian').apiVersion, testedAt: new Date().toISOString(), skippedObjectGroups, passed: results.filter(r => r.passed).length, results };
   } finally {
     restoreRegisters?.();
     // Flush the pending Markdown save before trashing the disposable file.

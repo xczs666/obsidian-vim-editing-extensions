@@ -1,9 +1,9 @@
 {
   "id": "vim-editing-extensions",
   "name": "Vim Editing Extensions",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "minAppVersion": "1.14.5",
-  "description": "Automatic quote and surrounding text objects, sandwich-style surround edits, and register replacement (gr) for built-in Vim mode.",
+  "description": "Extended Vim text objects, object navigation, sandwich-style surround edits, and register replacement for the built-in Vim mode.",
   "author": "xczs666",
   "authorUrl": "https://github.com/xczs666",
   "isDesktopOnly": true

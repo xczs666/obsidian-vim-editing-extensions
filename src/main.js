@@ -3,12 +3,22 @@ import { Transaction } from '@codemirror/state';
 import { isolateHistory } from '@codemirror/commands';
 import { installVimExtensions } from './vim.js';
 import { runSmoke } from './smoke.js';
+import { normalizeSettings, objectMappings } from './object-settings.js';
+import { EditingSettingsTab } from './settings-tab.js';
+import { isForwardedKey } from './prefixes.js';
 
 export default class VimEditingExtensions extends Plugin {
-  onload() {
+  async onload() {
     this.controllers = new Map();
     this.disposed = false;
     this.reported = false;
+    this.keyEvents = new WeakMap();
+    this.settings = normalizeSettings(await this.loadData());
+    try { objectMappings(this.settings); } catch (error) {
+      this.settings = normalizeSettings();
+      new Notice(`Vim Editing Extensions: invalid saved settings; using defaults. ${error.message}`);
+    }
+    this.addSettingTab(new EditingSettingsTab(this.app, this));
     this.app.workspace.onLayoutReady(() => this.install());
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => {
       for (const controller of this.controllers.values()) controller.cancelAll();
@@ -35,6 +45,22 @@ export default class VimEditingExtensions extends Plugin {
 
   getCM(view) { return view?.editMode?.editor?.cm?.cm ?? view?.editor?.cm?.cm; }
 
+  async updateSettings(settings) {
+    const next = normalizeSettings(settings);
+    objectMappings(next);
+    const previous = this.settings;
+    this.settings = next;
+    this.settingsWrite = (this.settingsWrite ?? Promise.resolve()).catch(() => {}).then(() => this.saveData(this.settings));
+    try { await this.settingsWrite; } catch (error) {
+      if (this.settings === next) this.settings = previous;
+      throw error;
+    }
+    if (this.disposed || this.settings !== next) return;
+    for (const controller of this.controllers.values()) controller.uninstall();
+    this.controllers.clear();
+    this.install();
+  }
+
   install() {
     if (this.disposed) return;
     const windows = new Set([this.app.workspace.containerEl.ownerDocument.defaultView]);
@@ -44,20 +70,38 @@ export default class VimEditingExtensions extends Plugin {
       if (!V || this.controllers.has(V)) continue;
       try {
         const controller = installVimExtensions(V, {
+          settings: this.settings,
           notify: text => new Notice(text),
           isCurrent: cm => this.getCM(this.app.workspace.activeLeaf?.view) === cm,
+          getEvent: () => this.keyEvents.get(win),
           prompt: (cm, request) => this.prompt(cm, request),
           applyEdit: (cm, edit) => this.applyEdit(cm, edit),
         });
         this.controllers.set(V, controller);
         // Cleanup incomplete motions after physical key dispatch, not internal events.
-        this.registerDomEvent(win.document, 'keydown', event => {
-          if (event.isComposing || event.keyCode === 229) return;
-          const cm = this.getCM(this.app.workspace.activeLeaf?.view);
-          if (!cm || event.target?.closest?.('[data-vim-editing-prompt]')) return;
-          const key = event.key === 'Escape' ? '<Esc>' : event.key;
-          queueMicrotask(() => controller.finishInput(cm, key));
-        });
+        this.keyWindows ??= new WeakSet();
+        if (!this.keyWindows.has(win)) {
+          const cancel = () => this.controllers.get(V)?.cancelPrefixes();
+          this.registerDomEvent(win, 'keydown', event => {
+            if (isForwardedKey(event)) return;
+            if (event.isComposing || event.keyCode === 229) { cancel(); return; }
+            this.keyEvents.set(win, event);
+            const cm = this.getCM(this.app.workspace.activeLeaf?.view);
+            // Native event dispatch can run microtasks between capture and
+            // target listeners. Keep the event until the entire dispatch ends.
+            win.setTimeout(() => {
+              if (this.keyEvents.get(win) === event) this.keyEvents.delete(win);
+              if (cm && !event.target?.closest?.('[data-vim-editing-prompt]')) {
+                this.controllers.get(V)?.finishInput(cm, event.key === 'Escape' ? '<Esc>' : event.key);
+              }
+            }, 0);
+          }, true);
+          this.registerDomEvent(win, 'blur', cancel);
+          this.registerDomEvent(win.document, 'pointerdown', cancel, true);
+          this.registerDomEvent(win.document, 'compositionstart', cancel, true);
+          this.registerDomEvent(win.document, 'focusin', cancel, true);
+        }
+        this.keyWindows.add(win);
       } catch (error) {
         console.error('[vim-editing-extensions] Unsupported Vim runtime:', error);
         if (!this.reported) {

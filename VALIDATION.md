@@ -1,5 +1,32 @@
 # Validation
 
+## Public release 0.3.0
+
+Validation date: 2026-11-12. This version was installed and validated locally before publication.
+
+| Check | Result |
+| --- | --- |
+| Portable reference-engine and pure resolver tests (`npm test`) | 58 / 58 passed |
+| Obsidian 1.15.0 actual bundled-engine integration tests (`npm run test:obsidian`) | 40 / 40 passed |
+| Obsidian 1.14.5 installed base-engine integration tests | 40 / 40 passed |
+| Running Obsidian 1.15.0 source editor | 87 / 87 passed |
+| Running Obsidian 1.15.0 live-preview editor | 87 / 87 passed |
+| Settings tab rejects duplicate identifiers and restores defaults | Passed in app |
+| Timeout settings reject invalid values and persist 100 ms | Passed in app |
+| Physical single-key timeout in source/live preview and timely surround edit | Passed in app |
+| Physical unmatched-key handoff to a host listener and insert-mode fallback | Passed in app |
+| Build and local installation asset comparison | Passed |
+| Source credential scan (Gitleaks) | No findings |
+| Private-domain, personal-path, email and accidental-note checks | No findings in source/build snapshot |
+
+The 174 in-app checks used a disposable note, all object groups, default identifiers, navigation, and the optional URL/whitespace/document mappings enabled. No object group was skipped. The command restored its registers and original active leaf, flushed the temporary note before moving it to the vault trash, and the note was confirmed absent from the vault root. Reports contain generated test fixtures only and remain ignored local artifacts.
+
+The new tests cover first/last/consecutive separators, the separate meanings of `i_`, `i,` and `ia`, counts and visual expansion, subwords, double brackets and bracket-only matching, indentation with blank lines/tabs/frontmatter/fence boundaries, ordinary and structured key/value lines, nested arguments and lexical function calls, cross-line next/previous selection, custom literal prompts with cancellation and concrete dot-repeat, optional mappings, remapping and group disable/re-enable. Existing surround, register replacement, history and register-preservation tests remain included.
+
+The plugin's general defaults leave the three optional mappings off; this local installation explicitly enables them. The test bridge uses locally extracted engines only; neither those engines nor personal settings are redistributed.
+
+Prefix tests cover the exact 99/100 ms boundary, a delayed timer, accepted combinations retaining unlimited time for their remaining motion/target, shorter native/custom mappings, counts and named registers, foreign s-prefixed mappings, cancellation, zero/unlimited waiting, and internal mappings avoiding unrelated physical-event replay. The in-app physical check exposed and fixed premature microtask cleanup between native event listeners. A before-deadline physical mismatch check used 5000 ms to accommodate native automation delays; deterministic engine tests verify the 100 ms boundary. Final local settings use 100 ms. The remaining-key host handoff uses a synthetic event; trusted-event-only handlers are outside the compatibility claim.
+
 ## Public release 0.2.0
 
 Validation date: 2026-11-10.
@@ -43,4 +70,4 @@ The temporary check note was saved, moved to the vault trash and confirmed absen
 
 ## Boundaries
 
-Mobile, blockwise selection editing, multiple cursors, macros, function/argument objects, arbitrary delimiter prompts and advanced next/previous object searching are outside this release. The tests do not claim complete equivalence to every feature of Vim plugins that inspired the key bindings.
+Mobile, blockwise selection editing, multiple cursors, macros, full language-grammar objects, folds, viewport objects and diagnostics are outside the current build. Native block insertion is preserved. Key/value objects are single-line; arguments and calls use lexical matching rather than a language parser. The tests do not claim complete equivalence to every feature of Vim plugins that inspired the key bindings.
